@@ -2,10 +2,10 @@
 
 [![License: MIT](https://img.shields.io/github/license/renaudcerrato/opencode-jbcontext)](LICENSE)
 [![Tests](https://github.com/renaudcerrato/opencode-jbcontext/actions/workflows/test.yml/badge.svg)](https://github.com/renaudcerrato/opencode-jbcontext/actions/workflows/test.yml)
-![Statements](https://img.shields.io/badge/statements-97.85%25-brightgreen.svg?style=flat)
+![Statements](https://img.shields.io/badge/statements-100%25-brightgreen.svg?style=flat)
 ![Branches](https://img.shields.io/badge/branches-100%25-brightgreen.svg?style=flat)
 ![Functions](https://img.shields.io/badge/functions-100%25-brightgreen.svg?style=flat)
-![Lines](https://img.shields.io/badge/lines-97.69%25-brightgreen.svg?style=flat)
+![Lines](https://img.shields.io/badge/lines-100%25-brightgreen.svg?style=flat)
 
 [OpenCode](https://opencode.ai) plugin that keeps the current git repository indexed by [JetBrains Context (jbcontext)](https://jbcontext.com) for semantic code search — indexing on session start, exactly like jbcontext's own Codex integration.
 
