@@ -1,0 +1,41 @@
+name: Publish
+
+# Publishes the plugin to npm via Trusted Publishing (OIDC) — no NPM_TOKEN
+# secret required. Requires a one-time setup on npmjs.com:
+#   package settings → Trusted Publisher → GitHub Actions
+#   repository: renaudcerrato/opencode-jbcontext
+#   workflow:   publish.yml
+# Trigger by running the workflow manually from the Actions tab (or via
+# `gh workflow run publish.yml`); it publishes whatever version is in
+# package.json.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Check version is not already published
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          NAME=$(node -p "require('./package.json').name")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "::error::$NAME@$VERSION is already published. Bump the version first."
+            exit 1
+          fi
+      - name: Publish
+        run: npm publish --provenance --access public

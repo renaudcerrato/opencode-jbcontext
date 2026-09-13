@@ -1,0 +1,40 @@
+{
+  "name": "@renaudcerrato/opencode-jbcontext",
+  "version": "1.0.0",
+  "description": "OpenCode plugin that keeps the current git repository indexed by JetBrains Context (jbcontext) for semantic code search.",
+  "main": "src/index.ts",
+  "type": "module",
+  "files": [
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "jest --config jest.config.cjs --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/renaudcerrato/opencode-jbcontext.git"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "jbcontext",
+    "jetbrains",
+    "context",
+    "semantic-search",
+    "code-search"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.17.7",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^25.9.3",
+    "istanbul-badges-readme": "^1.9.0",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.11",
+    "typescript": "^5.9.3"
+  }
+}
