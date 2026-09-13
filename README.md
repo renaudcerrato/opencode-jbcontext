@@ -7,7 +7,7 @@
 ![Functions](https://img.shields.io/badge/functions-100%25-brightgreen.svg?style=flat)
 ![Lines](https://img.shields.io/badge/lines-100%25-brightgreen.svg?style=flat)
 
-[OpenCode](https://opencode.ai) plugin that keeps the current git repository indexed by [JetBrains Context (jbcontext)](https://jbcontext.com) for semantic code search — indexing on session start, exactly like jbcontext's own Codex integration.
+[OpenCode](https://opencode.ai) plugin that keeps the current project directory indexed by [JetBrains Context (jbcontext)](https://jbcontext.com) for semantic code search — indexing on session start, exactly like jbcontext's own Codex integration.
 
 ## Contents
 

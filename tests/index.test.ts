@@ -1127,7 +1127,7 @@ describe("createHooks tool.execute.before", () => {
 		expect(deps.runIndexCalls).toEqual([]);
 	});
 
-	it("resolves the session directory and git root before a code_search call", async () => {
+	it("resolves the session directory before a code_search call", async () => {
 		const deps = makeDeps();
 		const hooks = createHooks(deps);
 		await hooks.config(CONFIG_ONE as never);
@@ -1135,8 +1135,8 @@ describe("createHooks tool.execute.before", () => {
 			tool: "jbcontext_code_search",
 			sessionID: "s1",
 		} as never);
-		// Join-only: the session dir and git root are resolved (so a manual
-		// index started concurrently can be joined), but no index is started.
+		// Join-only: the session directory is resolved (so a manual index
+		// started concurrently can be joined), but no index is started.
 		expect(deps.sessionDirCalls).toEqual(["s1"]);
 		expect(deps.runIndexCalls).toEqual([]);
 	});
@@ -1398,7 +1398,7 @@ describe("jbcontextPlugin", () => {
 	});
 
 
-	it("wires the SDK: session dir lookup, git root, and index run", async () => {
+	it("wires the SDK: session dir lookup and index run", async () => {
 		const logCalls: LogCall[] = [];
 		const client = makeClient(logCalls, { s1: "/session/dir" });
 		const { $, shellCalls } = makeShell({
@@ -1528,7 +1528,7 @@ describe("jbcontextPlugin", () => {
 
 		// Start a manual index for the init-dir root, then let a search for the
 		// unknown session join it — the search resolves the session directory
-		// (falling back to the init dir) and the same git root.
+		// (falling back to the init dir), matching the manual run's key.
 		const manual = (
 			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
 		)({} as never, { directory: "/init/dir", sessionID: "manual" } as never);

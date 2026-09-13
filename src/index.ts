@@ -232,8 +232,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 				enabled = false;
 				return;
 			}
-			let match: ServerMatch;
-			match = findJbcontextServer({ mcp: mcpSnapshot });
+			const match = findJbcontextServer({ mcp: mcpSnapshot });
 			if (match.matchCount > 1) {
 				throw new Error(
 					`jbcontext-index plugin: multiple enabled jbcontext MCP servers found (${match.matchNames.join(", ")}); configure exactly one.`,

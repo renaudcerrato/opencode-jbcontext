@@ -1,7 +1,7 @@
 {
   "name": "@renaudcerrato/opencode-jbcontext",
   "version": "1.0.0",
-  "description": "OpenCode plugin that keeps the current git repository indexed by JetBrains Context (jbcontext) for semantic code search.",
+  "description": "OpenCode plugin that keeps the current project directory indexed by JetBrains Context (jbcontext) for semantic code search.",
   "main": "src/index.ts",
   "type": "module",
   "files": [
