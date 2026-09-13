@@ -222,14 +222,19 @@ export function createHooks(deps: JbcontextPluginDeps) {
 		// - When the CLI is missing entirely, warn once with the install
 		//   command and stay inactive.
 		config: async (cfg: Config) => {
-			let match: ServerMatch;
+			// Snapshot cfg.mcp once: hostile configs (throwing getters) fail
+			// here, deterministically, instead of at unpredictable read points
+			// deeper in the hook.
+			let mcpSnapshot: unknown;
 			try {
-				match = findJbcontextServer(cfg as unknown);
+				mcpSnapshot = (cfg as { mcp?: unknown }).mcp;
 			} catch {
 				// Hostile config shape (throwing getters): stay inactive.
 				enabled = false;
 				return;
 			}
+			let match: ServerMatch;
+			match = findJbcontextServer({ mcp: mcpSnapshot });
 			if (match.matchCount > 1) {
 				throw new Error(
 					`jbcontext-index plugin: multiple enabled jbcontext MCP servers found (${match.matchNames.join(", ")}); configure exactly one.`,
@@ -273,16 +278,10 @@ export function createHooks(deps: JbcontextPluginDeps) {
 			// user-configured disabled jbcontext entry regardless of its config
 			// key — an explicit "keep it off" decision must not be silently
 			// reversed by registering a new enabled server alongside it.
-			try {
-				const disabled = findJbcontextServer(cfg as unknown, {
-					includeDisabled: true,
-				});
-				if (disabled.matchCount > 0) {
-					enabled = false;
-					return;
-				}
-			} catch {
-				// Hostile config shape: stay inactive.
+			const disabled = findJbcontextServer({ mcp: mcpSnapshot }, {
+				includeDisabled: true,
+			});
+			if (disabled.matchCount > 0) {
 				enabled = false;
 				return;
 			}
@@ -291,14 +290,11 @@ export function createHooks(deps: JbcontextPluginDeps) {
 			// entry there — remote entries are invisible to the basename scans
 			// by design (they are respected via this key-existence guard, not
 			// basename matching), and any shape under that key is user intent.
-			try {
-				const mcpObj = (cfg as { mcp?: Record<string, unknown> }).mcp;
-				if (mcpObj && Object.prototype.hasOwnProperty.call(mcpObj, "jbcontext")) {
-					enabled = false;
-					return;
-				}
-			} catch {
-				// Hostile config shape: stay inactive.
+			if (
+				mcpSnapshot &&
+				typeof mcpSnapshot === "object" &&
+				Object.prototype.hasOwnProperty.call(mcpSnapshot, "jbcontext")
+			) {
 				enabled = false;
 				return;
 			}

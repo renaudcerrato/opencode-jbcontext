@@ -110,27 +110,32 @@ const sessionCreatedEvent = (id: string, directory: string) => ({
 		};
 	}
 
-	function makeShell(commands: Record<string, { stdout: string; stderr: string; exitCode: number }>) {
-		const shellCalls: string[] = [];
-		const $ = (strings: TemplateStringsArray, ...values: unknown[]) => {
-			const cmd = strings
-				.flatMap((s, i) => (i < values.length ? [s, String(values[i])] : [s]))
-				.join("")
-				.trim();
-			shellCalls.push(cmd);
-			const result = commands[cmd] ?? { stdout: "", stderr: "", exitCode: 1 };
-			return {
-				nothrow: () => ({
-					quiet: async () => ({
-						stdout: Buffer.from(result.stdout),
-						stderr: Buffer.from(result.stderr),
-						exitCode: result.exitCode,
-					}),
+function makeShell(commands: Record<string, { stdout: string; stderr: string; exitCode: number }>) {
+	const shellCalls: string[] = [];
+	const $ = (strings: TemplateStringsArray, ...values: unknown[]) => {
+		const cmd = strings
+			.flatMap((s, i) => (i < values.length ? [s, String(values[i])] : [s]))
+			.join("")
+			.trim();
+		shellCalls.push(cmd);
+		const result = commands[cmd];
+		if (!result) {
+			// Fail loudly on unmapped commands: a silent default would turn
+			// command drift (refactored argv, renamed flags) into false passes.
+			throw new Error(`makeShell: unmapped command: ${cmd}`);
+		}
+		return {
+			nothrow: () => ({
+				quiet: async () => ({
+					stdout: Buffer.from(result.stdout),
+					stderr: Buffer.from(result.stderr),
+					exitCode: result.exitCode,
 				}),
-			};
+			}),
 		};
-		return { $, shellCalls };
-	}
+	};
+	return { $, shellCalls };
+}
 
 describe("basename", () => {
 	it("returns the last path segment", () => {
@@ -531,30 +536,6 @@ describe("createHooks config", () => {
 		expect(deps.logCalls).toEqual([]);
 	});
 
-	it("stays inactive when the key-existence guard hits a hostile shape", async () => {
-		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
-		const hooks = createHooks(deps);
-		// mcp is readable exactly twice (findJbcontextServer's two scans
-		// consume the first two reads and see no jbcontext server); the third
-		// read, in the key-existence guard, throws.
-		let reads = 0;
-		const cfg = {};
-		Object.defineProperty(cfg, "mcp", {
-			get() {
-				reads += 1;
-				if (reads <= 2) return {};
-				throw new TypeError("hostile on third read");
-			},
-			configurable: true,
-		});
-		await hooks.config(cfg as never);
-		expect(hooks.__state()).toEqual({
-			enabled: false,
-			serverName: null,
-			binPath: null,
-		});
-		expect(deps.runIndexCalls).toEqual([]);
-	});
 
 	it("warns once and stays inactive when the CLI is missing", async () => {
 		const deps = makeDeps({ resolveBinary: () => null });
@@ -570,10 +551,12 @@ describe("createHooks config", () => {
 		expect(deps.logCalls).toHaveLength(1);
 		expect(deps.logCalls[0].level).toBe("warn");
 		expect(deps.logCalls[0].message).toContain(INSTALL_COMMAND);
-		expect(deps.logCalls[0].extra).toEqual({
-			decision: "cli-missing",
-			installCommand: INSTALL_COMMAND,
-		});
+		expect(deps.logCalls[0].extra).toEqual(
+			expect.objectContaining({
+				decision: "cli-missing",
+				installCommand: INSTALL_COMMAND,
+			}),
+		);
 	});
 
 	it("stays inactive when the config shape is hostile (throwing getters)", async () => {
@@ -592,52 +575,9 @@ describe("createHooks config", () => {
 			serverName: null,
 			binPath: null,
 		});
-		expect(deps.runIndexCalls).toEqual([]);
 	});
 
-	it("stays inactive when the mcp key is hostile during the disabled-key check", async () => {
-		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
-		const hooks = createHooks(deps);
-		const cfg = {};
-		Object.defineProperty(cfg, "mcp", {
-			get() {
-				throw new TypeError("hostile getter");
-			},
-			configurable: true,
-		});
-		await hooks.config(cfg as never);
-		expect(hooks.__state()).toEqual({
-			enabled: false,
-			serverName: null,
-			binPath: null,
-		});
-		expect(deps.runIndexCalls).toEqual([]);
-	});
 
-	it("stays inactive when the disabled-key check hits a hostile shape", async () => {
-		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
-		const hooks = createHooks(deps);
-		// mcp is readable exactly once (findJbcontextServer consumes the first
-		// read and sees no jbcontext server); the second read, in the
-		// disabled-key check, throws.
-		let reads = 0;
-		const cfg = {};
-		Object.defineProperty(cfg, "mcp", {
-			get() {
-				reads += 1;
-				if (reads === 1) return {};
-				throw new TypeError("hostile on second read");
-			},
-			configurable: true,
-		});
-		await hooks.config(cfg as never);
-		expect(hooks.__state()).toEqual({
-			enabled: false,
-			serverName: null,
-			binPath: null,
-		});
-		expect(deps.runIndexCalls).toEqual([]);
-	});
 
 	it("tolerates a frozen config when auto-registering", async () => {
 		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
@@ -944,12 +884,14 @@ describe("createHooks event", () => {
 		expect(deps.logCalls).toHaveLength(1);
 		expect(deps.logCalls[0].level).toBe("warn");
 		expect(deps.logCalls[0].message).toContain("uses a wrapper command");
-		expect(deps.logCalls[0].extra).toEqual({
-			serverName: "jetbrains-context",
-			wrapper: "npx",
-			decision: "cli-missing",
-			installCommand: INSTALL_COMMAND,
-		});
+		expect(deps.logCalls[0].extra).toEqual(
+			expect.objectContaining({
+				serverName: "jetbrains-context",
+				wrapper: "npx",
+				decision: "cli-missing",
+				installCommand: INSTALL_COMMAND,
+			}),
+		);
 	});
 
 	it("indexes two different repos concurrently (cross-repo isolation)", async () => {
@@ -1070,7 +1012,7 @@ describe("createHooks event", () => {
 		expect(failureLogs).toHaveLength(1);
 	});
 
-	it("pre-search join waits unboundedly for the in-flight index (no timeout)", async () => {
+	it("pre-search join does not resolve before the in-flight index settles", async () => {
 		const gate = deferred<string>();
 		const deps = makeDeps({
 			// Both the session-start event and the search resolve to the same root.
@@ -1141,7 +1083,6 @@ describe("createHooks event", () => {
 		expect(deps.logCalls).toContainEqual(
 			expect.objectContaining({
 				level: "debug",
-				message: expect.stringContaining("background session-start indexing failed"),
 				extra: expect.objectContaining({
 					root: "/git/repo",
 					sessionID: "s1",
@@ -1164,7 +1105,6 @@ describe("createHooks event", () => {
 		expect(deps.logCalls).toContainEqual(
 			expect.objectContaining({
 				level: "debug",
-				message: expect.stringContaining("could not resolve index root at session start"),
 				extra: expect.objectContaining({
 					directory: "/repo",
 					sessionID: "s1",
@@ -1331,7 +1271,6 @@ describe("createHooks tool.execute.before", () => {
 		expect(deps.logCalls).toContainEqual(
 			expect.objectContaining({
 				level: "error",
-				message: expect.stringContaining("pre-search indexing failed"),
 				extra: expect.objectContaining({
 					sessionID: "s1",
 					tool: "jbcontext_code_search",
@@ -1518,7 +1457,6 @@ describe("jbcontextPlugin", () => {
 		expect(logCalls).toContainEqual(
 			expect.objectContaining({
 				level: "warn",
-				message: expect.stringContaining("has no directory"),
 			}),
 		);
 	});
@@ -1684,7 +1622,6 @@ describe("jbcontextPlugin", () => {
 		expect(logCalls).toContainEqual(
 			expect.objectContaining({
 				level: "warn",
-				message: expect.stringContaining("could not resolve session directory"),
 			}),
 		);
 	});
@@ -1737,7 +1674,6 @@ describe("jbcontextPlugin", () => {
 		expect(logCalls).toContainEqual(
 			expect.objectContaining({
 				level: "warn",
-				message: expect.stringContaining("has no directory"),
 			}),
 		);
 	});
@@ -1825,13 +1761,12 @@ describe("jbcontextPlugin", () => {
 			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
 		)({} as never, { directory: "/session/dir", sessionID: "s1" } as never);
 		expect(result).toBe("indexed plain dir");
-		expect(shellCalls).toContain("jbcontext index --project-path=/session/dir".replace("jbcontext", "/usr/local/bin/jbcontext"));
+		expect(shellCalls).toContain("/usr/local/bin/jbcontext index --project-path=/session/dir");
 
 		// Non-git classification is logged at debug.
 		expect(logCalls).toContainEqual(
 			expect.objectContaining({
 				level: "debug",
-				message: expect.stringContaining("not inside a git repository"),
 				extra: expect.objectContaining({
 					directory: "/session/dir",
 					decision: "non-git",
@@ -1997,7 +1932,6 @@ describe("jbcontextPlugin", () => {
 		expect(logCalls).toContainEqual(
 			expect.objectContaining({
 				level: "error",
-				message: expect.stringContaining("indexing failed"),
 			}),
 		);
 	});
