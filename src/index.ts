@@ -98,7 +98,9 @@ export type ServerMatch = {
  * Pure: scan merged config for jbcontext MCP servers by binary basename.
  * By default only enabled local servers match; with `includeDisabled`,
  * disabled local servers match too (used to respect explicit keep-it-off
- * entries regardless of their config key).
+ * entries regardless of their config key). Remote entries are invisible to
+ * both scans by design — they are respected via the key-existence guard in
+ * the config hook, not basename matching.
  */
 export function findJbcontextServer(
 	config: unknown,
@@ -248,7 +250,22 @@ export function createHooks(deps: JbcontextPluginDeps) {
 				enabled = false;
 				return;
 			}
-			// No existing jbcontext server: auto-register one.
+			// No existing jbcontext server: auto-register one. Final safety net:
+			// never write under the literal "jbcontext" key if the user has any
+			// entry there — remote entries are invisible to the basename scans
+			// by design (they are respected via this key-existence guard, not
+			// basename matching), and any shape under that key is user intent.
+			try {
+				const mcpObj = (cfg as { mcp?: Record<string, unknown> }).mcp;
+				if (mcpObj && Object.prototype.hasOwnProperty.call(mcpObj, "jbcontext")) {
+					enabled = false;
+					return;
+				}
+			} catch {
+				// Hostile config shape: stay inactive.
+				enabled = false;
+				return;
+			}
 			const resolved = (deps.resolveBinary ?? resolveBinaryPath)();
 			if (!resolved) {
 				enabled = false;

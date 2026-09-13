@@ -433,6 +433,74 @@ describe("createHooks config", () => {
 		});
 	});
 
+	it("respects a disabled remote entry under the jbcontext key (never clobbered)", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		const cfg = {
+			mcp: {
+				jbcontext: { type: "remote", enabled: false, url: "https://example.com" },
+			},
+		};
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: false,
+			serverName: null,
+			binPath: null,
+		});
+		expect(cfg.mcp.jbcontext).toEqual({
+			type: "remote",
+			enabled: false,
+			url: "https://example.com",
+		});
+		expect(deps.logCalls).toEqual([]);
+	});
+
+	it("respects an enabled remote entry under the jbcontext key (never clobbered)", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		const cfg = {
+			mcp: {
+				jbcontext: { type: "remote", url: "https://example.com" },
+			},
+		};
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: false,
+			serverName: null,
+			binPath: null,
+		});
+		expect(cfg.mcp.jbcontext).toEqual({
+			type: "remote",
+			url: "https://example.com",
+		});
+		expect(deps.logCalls).toEqual([]);
+	});
+
+	it("stays inactive when the key-existence guard hits a hostile shape", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		// mcp is readable exactly twice (findJbcontextServer's two scans
+		// consume the first two reads and see no jbcontext server); the third
+		// read, in the key-existence guard, throws.
+		let reads = 0;
+		const cfg = {};
+		Object.defineProperty(cfg, "mcp", {
+			get() {
+				reads += 1;
+				if (reads <= 2) return {};
+				throw new TypeError("hostile on third read");
+			},
+			configurable: true,
+		});
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: false,
+			serverName: null,
+			binPath: null,
+		});
+		expect(deps.runIndexCalls).toEqual([]);
+	});
+
 	it("warns once and stays inactive when the CLI is missing", async () => {
 		const deps = makeDeps({ resolveBinary: () => null });
 		const hooks = createHooks(deps);
