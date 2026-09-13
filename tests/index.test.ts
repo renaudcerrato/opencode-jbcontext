@@ -335,31 +335,35 @@ describe("createHooks config", () => {
 	});
 
 	it("auto-registers using the real resolver when deps.resolveBinary is not provided", async () => {
-		const deps = makeDeps();
-		const hooks = createHooks(deps);
-		const cfg: Record<string, unknown> = {};
-		await hooks.config(cfg as never);
-		const resolved = resolveBinaryPath();
-		if (resolved) {
-			// CLI installed on this machine: registered and enabled.
+		// Hermetic: force the real resolver to find a hit via mocked fs.
+		const originalAccess = fs.accessSync;
+		const originalPath = process.env.PATH;
+		process.env.PATH = "/resolved/bin";
+		fs.accessSync = (p: any) => {
+			if (p === "/resolved/bin/jbcontext") return undefined;
+			throw new Error("ENOENT");
+		};
+		try {
+			const deps = makeDeps();
+			const hooks = createHooks(deps);
+			const cfg: Record<string, unknown> = {};
+			await hooks.config(cfg as never);
 			expect(hooks.__state()).toEqual({
 				enabled: true,
 				serverName: "jbcontext",
-				binPath: resolved,
+				binPath: "/resolved/bin/jbcontext",
 			});
 			expect((cfg.mcp as Record<string, unknown>).jbcontext).toEqual({
 				type: "local",
-				command: [resolved, "mcp"],
+				command: ["/resolved/bin/jbcontext", "mcp"],
 			});
-		} else {
-			// CLI absent: single warning, inactive.
-			expect(hooks.__state()).toEqual({
-				enabled: false,
-				serverName: null,
-				binPath: null,
-			});
-			expect(deps.logCalls).toHaveLength(1);
-			expect(deps.logCalls[0].level).toBe("warn");
+		} finally {
+			fs.accessSync = originalAccess;
+			if (originalPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = originalPath;
+			}
 		}
 	});
 
@@ -384,6 +388,49 @@ describe("createHooks config", () => {
 			command: ["/old/jbcontext"],
 		});
 		expect(deps.logCalls).toEqual([]);
+	});
+
+	it("respects a disabled jbcontext entry under a custom key (basename-based)", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		const cfg = {
+			mcp: {
+				"jetbrains-context": {
+					type: "local",
+					enabled: false,
+					command: ["/opt/jbcontext"],
+				},
+			},
+		};
+		await hooks.config(cfg as never);
+		// No new enabled server is registered alongside the disabled one.
+		expect(hooks.__state()).toEqual({
+			enabled: false,
+			serverName: null,
+			binPath: null,
+		});
+		expect(Object.keys(cfg.mcp)).toEqual(["jetbrains-context"]);
+		expect(deps.logCalls).toEqual([]);
+	});
+
+	it("auto-registers when a disabled non-jbcontext server exists", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		const cfg = {
+			mcp: {
+				other: { type: "local", enabled: false, command: ["/bin/other"] },
+			},
+		};
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: true,
+			serverName: "jbcontext",
+			binPath: "/opt/jbcontext",
+		});
+		expect((cfg.mcp as Record<string, unknown>).jbcontext).toEqual({
+			type: "local",
+			command: ["/opt/jbcontext", "mcp"],
+		});
 	});
 
 	it("warns once and stays inactive when the CLI is missing", async () => {

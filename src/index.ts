@@ -94,8 +94,16 @@ export type ServerMatch = {
 	matchNames: string[];
 };
 
-/** Pure: scan merged config for enabled jbcontext MCP servers by binary basename. */
-export function findJbcontextServer(config: unknown): ServerMatch {
+/**
+ * Pure: scan merged config for jbcontext MCP servers by binary basename.
+ * By default only enabled local servers match; with `includeDisabled`,
+ * disabled local servers match too (used to respect explicit keep-it-off
+ * entries regardless of their config key).
+ */
+export function findJbcontextServer(
+	config: unknown,
+	options: { includeDisabled?: boolean } = {},
+): ServerMatch {
 	const matches: Array<{ name: string; binPath: string }> = [];
 	const mcp = (config as { mcp?: unknown } | null | undefined)?.mcp;
 	if (mcp && typeof mcp === "object") {
@@ -104,7 +112,8 @@ export function findJbcontextServer(config: unknown): ServerMatch {
 				| { type?: unknown; enabled?: unknown; command?: unknown }
 				| null
 				| undefined;
-			if (server?.type !== "local" || server?.enabled === false) continue;
+			if (server?.type !== "local") continue;
+			if (!options.includeDisabled && server?.enabled === false) continue;
 			const cmd = server?.command;
 			if (!Array.isArray(cmd) || cmd.length === 0) continue;
 			if (basename(String(cmd[0])) === "jbcontext") {
@@ -222,13 +231,15 @@ export function createHooks(deps: JbcontextPluginDeps) {
 				binPath = match.binPath;
 				return;
 			}
-			// No enabled jbcontext server. Before auto-registering, respect a
-			// user-configured entry under the "jbcontext" key even when it is
-			// disabled — an explicit "keep it off" decision must not be
-			// silently reversed.
+			// No enabled jbcontext server. Before auto-registering, respect any
+			// user-configured disabled jbcontext entry regardless of its config
+			// key — an explicit "keep it off" decision must not be silently
+			// reversed by registering a new enabled server alongside it.
 			try {
-				const existing = (cfg as { mcp?: Record<string, unknown> }).mcp;
-				if (existing && Object.prototype.hasOwnProperty.call(existing, "jbcontext")) {
+				const disabled = findJbcontextServer(cfg as unknown, {
+					includeDisabled: true,
+				});
+				if (disabled.matchCount > 0) {
 					enabled = false;
 					return;
 				}

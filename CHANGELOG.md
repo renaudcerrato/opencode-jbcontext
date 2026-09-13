@@ -15,8 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `jbcontext` MCP entry on the runtime config — spawned in the same session,
   no restart or config editing needed. The registered command is always an
   absolute path. Existing jbcontext MCP entries are never overridden —
-  including entries under the `jbcontext` key that the user explicitly
-  disabled.
+  including explicitly disabled entries, matched by binary basename
+  regardless of their config key.
 - Single warning with the official install command when the jbcontext CLI is
   not installed; the plugin stays inactive instead of spamming errors.
 - Background indexing on session creation (`session.created` event), mirroring
