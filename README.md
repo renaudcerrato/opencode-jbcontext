@@ -65,13 +65,11 @@ This plugin gives OpenCode the same treatment: the repository is indexed automat
 The plugin mirrors jbcontext's own Codex SessionStart hook (`jbcontext index --silent &`):
 
 1. **MCP registration** — if no jbcontext MCP server is configured, the plugin registers one automatically (resolving the binary from `PATH`, then the installer's default `~/.jbcontext/bin/jbcontext`). Wrapper invocations (`["npx", "jbcontext", "mcp"]`, `["/usr/bin/env", "jbcontext", "mcp"]`) are detected too — the binary may sit at argv[0] or argv[1]. Note: configs with extra flags before the binary (e.g. `["npx", "-y", "jbcontext", "mcp"]`) are not detected — use a direct binary path or a two-element wrapper. OpenCode initializes plugins before MCP servers, so the registered server is spawned in the same session — no restart, no config editing. An existing jbcontext MCP entry is never overridden (matched by binary basename, enabled or disabled; any entry under the literal `jbcontext` key is respected regardless of type).
-2. **Session start** — when a session is created, the plugin kicks off `jbcontext index` for the session's directory in the background (fire-and-forget). The session never waits for indexing. jbcontext resolves the git root itself when the directory is inside one.
+2. **Session start** — when a session is created, the plugin kicks off `jbcontext index` for the session's directory in the background (fire-and-forget). The session never waits for indexing.
 3. **Before a search** — when the semantic search tool runs (named `<your-server-key>_code_search`, typically `jbcontext_code_search`), the plugin joins an in-flight index if one is running (so the search sees fresh content) but never starts one. Indexing is triggered by session start and the manual tool only.
 4. **On demand** — the `jbcontext_index` tool (below) runs a fresh index whenever the agent asks for one.
 
 Concurrent index runs for the same directory are deduplicated: a caller that arrives while an index is running gets that run's output instead of spawning a second one.
-
-The plugin passes the session's working directory to jbcontext as-is — no git invocation, no repo-root resolution. jbcontext handles git repositories (resolving the root, revision tracking) and plain directories alike, deriving a stable repository id from the path.
 
 If the jbcontext CLI is not installed, the plugin logs a single warning with the install command and stays inactive:
 

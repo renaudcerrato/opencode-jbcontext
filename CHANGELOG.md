@@ -9,10 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Git-free by design: the plugin passes the session's working directory to
-  jbcontext as-is — no git invocation, no repo-root resolution. jbcontext
-  resolves the git root itself for repositories and derives a stable
-  repository id from the path for plain directories.
 - Automatic MCP server registration: if no jbcontext MCP server is configured,
   the plugin resolves the jbcontext binary (walking `PATH`, then the
   installer's default `~/.jbcontext/bin/jbcontext`) and registers a
