@@ -306,6 +306,49 @@ describe("createHooks event", () => {
 		await gate.promise;
 	});
 
+	it("deduplicates concurrent session-start indexes for the same repo (burst protection)", async () => {
+		const gate = deferred<string>();
+		let runCount = 0;
+		const deps = makeDeps({
+			runIndex: async () => {
+				runCount += 1;
+				return gate.promise;
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		// A burst of session creations for the same repo (subagents spawning).
+		const first = hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
+		const second = hooks.event({ event: sessionCreatedEvent("s2", "/repo") } as never);
+		await Promise.all([first, second]);
+		// Both fire-and-forget runs share one in-flight index.
+		expect(runCount).toBe(1);
+
+		// A search during the burst joins the session-start index.
+		const search = hooks["tool.execute.before"]({
+			tool: "jbcontext_code_search",
+			sessionID: "s1",
+		} as never);
+		gate.resolve("done");
+		await Promise.all([search, gate.promise]);
+		expect(runCount).toBe(1);
+	});
+
+	it("ignores malformed session.created events without info.directory", async () => {
+		const deps = makeDeps();
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+		await hooks.event({
+			event: { type: "session.created", properties: {} },
+		} as never);
+		await hooks.event({
+			event: { type: "session.created", properties: { info: {} } },
+		} as never);
+		expect(deps.gitRootCalls).toEqual([]);
+		expect(deps.runIndexCalls).toEqual([]);
+	});
+
 	it("logs and swallows background index failures", async () => {
 		const deps = makeDeps({
 			runIndex: async () => {
@@ -1119,6 +1162,45 @@ describe("jbcontextPlugin", () => {
 			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
 		)({} as never, { directory: "/session/dir", sessionID: "s1" } as never);
 		expect(result).toBe("uploaded snapshot\nwarning: stale cache");
+	});
+
+	it("swallows log transport failures without unhandled rejections", async () => {
+		const client = {
+			app: {
+				log: async () => {
+					throw new Error("log transport down");
+				},
+			},
+			session: {
+				get: async () => ({ data: { directory: "/session/dir" } }),
+			},
+		};
+		const { $ } = makeShell({
+			"git -C /session/dir rev-parse --show-toplevel": {
+				stdout: "/git/root\n",
+				stderr: "",
+				exitCode: 0,
+			},
+			"/usr/local/bin/jbcontext index --project-path=/git/root": {
+				stdout: "",
+				stderr: "",
+				exitCode: 0,
+			},
+		});
+
+		const plugin = await jbcontextPlugin({
+			client: client as never,
+			$,
+			directory: "/init/dir",
+		} as never);
+
+		await plugin.config(CONFIG_ONE as never);
+
+		// Indexing succeeds even though every log call rejects.
+		const result = await (
+			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
+		)({} as never, { directory: "/session/dir", sessionID: "s1" } as never);
+		expect(result).toMatch(/^jbcontext: indexed \/git\/root in \d+ms$/);
 	});
 
 	it("exposes the manual tool with metadata", async () => {

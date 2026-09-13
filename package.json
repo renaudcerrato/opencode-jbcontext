@@ -12,7 +12,8 @@
   ],
   "scripts": {
     "test": "jest --config jest.config.cjs --coverage",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "repository": {
     "type": "git",

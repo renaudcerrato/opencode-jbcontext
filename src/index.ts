@@ -41,7 +41,7 @@
 
 import type { Config, Plugin, PluginInput } from "@opencode-ai/plugin";
 
-/** Basename of a path (last segment after the final `/`). Avoids a node:path dependency. */
+/** Basename of a path (last segment after the final `/`). Avoids a node:path dependency. POSIX-only: on Windows, config paths use `/` in opencode's merged config. */
 export function basename(p: string): string {
 	return p.split("/").filter(Boolean).pop() ?? "";
 }
@@ -109,16 +109,14 @@ export function createHooks(deps: JbcontextPluginDeps) {
 	const indexingPromises = new Map<string, Promise<string>>();
 
 	/**
-	 * Index the repo, deduplicating concurrent runs for the same session+repo
+	 * Index the repo, deduplicating concurrent runs for the same repository
 	 * (a caller joining an in-flight run gets that run's output). Always
-	 * indexes — there is no throttle window.
+	 * indexes — there is no throttle window. Keyed by repo alone: the jbcontext
+	 * CLI is the shared resource, so a burst of session creations for the same
+	 * repo (subagents spawning) must share one run regardless of session.
 	 */
-	const indexRepo = (
-		bin: string,
-		root: string,
-		sessionID: string,
-	): Promise<string> => {
-		const key = `${sessionID}:${root}`;
+	const indexRepo = (bin: string, root: string, sessionID: string): Promise<string> => {
+		const key = root;
 
 		const existing = indexingPromises.get(key);
 		if (existing) {
@@ -139,12 +137,12 @@ export function createHooks(deps: JbcontextPluginDeps) {
 	};
 
 	/**
-	 * Join an in-flight index for the session+repo if one is running. Never
-	 * starts a new index — indexing is triggered by session creation and the
-	 * manual tool only (Codex SessionStart-hook parity).
+	 * Join an in-flight index for the repo if one is running. Never starts a
+	 * new index — indexing is triggered by session creation and the manual
+	 * tool only (Codex SessionStart-hook parity).
 	 */
-	const joinIndex = (bin: string, root: string, sessionID: string): Promise<string> => {
-		const existing = indexingPromises.get(`${sessionID}:${root}`);
+	const joinIndex = (root: string): Promise<string> => {
+		const existing = indexingPromises.get(root);
 		return existing ?? Promise.resolve("");
 	};
 
@@ -170,35 +168,36 @@ export function createHooks(deps: JbcontextPluginDeps) {
 		},
 
 		// Session creation: kick off a background index, Codex SessionStart-hook
-		// style. Fire-and-forget — never awaited, never blocks the session;
-		// in-flight dedupe prevents stampedes when subagent sessions spawn in
-		// bursts.
+		// style. Fire-and-forget — never awaited, never blocks the session.
+		// Routed through indexRepo so concurrent session creations for the same
+		// repo (subagent bursts) share one run, and so pre-search joins can see
+		// the in-flight session-start index.
 		event: async ({ event }: { event: { type: string; properties: any } }) => {
 			if (!enabled || !serverName || !binPath) return;
 			if (event.type !== "session.created") return;
-			const dir: string = event.properties.info.directory;
+			const info = event.properties?.info;
+			if (!info?.directory) return;
+			const dir: string = info.directory;
 			try {
 				const root = await deps.getGitRoot(dir);
-				deps
-					.runIndex(binPath, root)
-					.catch(async (err: unknown) => {
-						await deps.log(
-							"debug",
-							`jbcontext: background session-start indexing failed, proceeding without it`,
-							{
-								root,
-								sessionID: event.properties.info.id,
-								error: err instanceof Error ? err.message : String(err),
-							},
-						);
-					});
+				indexRepo(binPath, root, info.id).catch(async (err: unknown) => {
+					await deps.log(
+						"debug",
+						`jbcontext: background session-start indexing failed, proceeding without it`,
+						{
+							root,
+							sessionID: info.id,
+							error: err instanceof Error ? err.message : String(err),
+						},
+					);
+				});
 			} catch (err) {
 				await deps.log(
 					"debug",
 					`jbcontext: could not resolve git root at session start, skipping background index`,
 					{
 						directory: dir,
-						sessionID: event.properties.info.id,
+						sessionID: info.id,
 						error: err instanceof Error ? err.message : String(err),
 					},
 				);
@@ -216,7 +215,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 			try {
 				const dir = await deps.getSessionDirectory(input.sessionID);
 				const root = await deps.getGitRoot(dir);
-				await joinIndex(binPath, root, input.sessionID);
+				await joinIndex(root);
 			} catch (err) {
 				await deps.log(
 					"error",
@@ -257,16 +256,20 @@ export const jbcontextPlugin: Plugin = async ({
 	directory,
 }: PluginInput) => {
 	// --- state (per opencode process) ---
-	// git root cache keyed by cwd
+	// git root cache keyed by cwd. Unbounded by design: bounded in practice by
+	// the number of distinct working directories seen per opencode process.
 	const gitRootCache = new Map<string, string>();
-	// session directory cache keyed by sessionID
+	// session directory cache keyed by sessionID. Unbounded by design: bounded
+	// in practice by the number of sessions per opencode process.
 	const sessionDirCache = new Map<string, string>();
 
-	/** Structured log via opencode SDK. */
+	/** Structured log via opencode SDK. Never rejects. */
 	const log: Log = (level, message, extra) => {
-		void client.app.log({
-			body: { service: "opencode-jbcontext", level, message, extra },
-		});
+		client.app
+			.log({
+				body: { service: "opencode-jbcontext", level, message, extra },
+			})
+			.catch(() => {});
 		return Promise.resolve();
 	};
 
@@ -351,5 +354,3 @@ export const jbcontextPlugin: Plugin = async ({
 
 	return createHooks({ log, getGitRoot, getSessionDirectory, runIndex });
 };
-
-export const server = jbcontextPlugin;

@@ -27,7 +27,7 @@ jobs:
       # is captured from the same run and appended to the job summary.
       - name: Run tests
         run: |
-          npm test -- --coverage --coverageReporters=text --coverageReporters=text-summary --coverageReporters=json-summary | tee jest-output.txt
+          npm test -- --coverageReporters=text --coverageReporters=text-summary --coverageReporters=json-summary 2>&1 | tee jest-output.txt
       - name: Coverage summary
         if: matrix.node-version == 22
         run: |
