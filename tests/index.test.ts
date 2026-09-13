@@ -228,20 +228,34 @@ describe("findJbcontextServer", () => {
 
 describe("resolveBinaryPath", () => {
 	const originalAccess = fs.accessSync;
+	const originalPath = process.env.PATH;
 
 	afterEach(() => {
 		fs.accessSync = originalAccess;
+		process.env.PATH = originalPath;
 	});
 
-	it("returns the first usable candidate (PATH binary)", () => {
+	it("walks PATH directories in order and returns the first hit", () => {
+		process.env.PATH = "/first/bin:/second/bin";
 		fs.accessSync = (p: any) => {
-			if (p === "jbcontext") return undefined;
+			if (p === "/second/bin/jbcontext") return undefined;
 			throw new Error("ENOENT");
 		};
-		expect(resolveBinaryPath()).toBe("jbcontext");
+		expect(resolveBinaryPath()).toBe("/second/bin/jbcontext");
+	});
+
+	it("prefers the first PATH directory containing the binary", () => {
+		process.env.PATH = "/first/bin:/second/bin";
+		fs.accessSync = (p: any) => {
+			if (p === "/first/bin/jbcontext" || p === "/second/bin/jbcontext")
+				return undefined;
+			throw new Error("ENOENT");
+		};
+		expect(resolveBinaryPath()).toBe("/first/bin/jbcontext");
 	});
 
 	it("falls back to the installer default path when PATH lacks the binary", () => {
+		process.env.PATH = "/first/bin";
 		fs.accessSync = (p: any) => {
 			if (p === DEFAULT_BIN_PATH) return undefined;
 			throw new Error("ENOENT");
@@ -249,7 +263,25 @@ describe("resolveBinaryPath", () => {
 		expect(resolveBinaryPath()).toBe(DEFAULT_BIN_PATH);
 	});
 
+	it("skips empty PATH segments", () => {
+		process.env.PATH = "::/first/bin::";
+		fs.accessSync = (p: any) => {
+			if (p === "/first/bin/jbcontext") return undefined;
+			throw new Error("ENOENT");
+		};
+		expect(resolveBinaryPath()).toBe("/first/bin/jbcontext");
+	});
+
 	it("returns null when no candidate is usable", () => {
+		process.env.PATH = "/first/bin";
+		fs.accessSync = () => {
+			throw new Error("ENOENT");
+		};
+		expect(resolveBinaryPath()).toBeNull();
+	});
+
+	it("returns null when PATH is unset and the default path is missing", () => {
+		delete process.env.PATH;
 		fs.accessSync = () => {
 			throw new Error("ENOENT");
 		};
@@ -262,20 +294,72 @@ describe("resolveBinaryPath", () => {
 // ---------------------------------------------------------------------------
 
 describe("createHooks config", () => {
-	it("auto-registers the MCP server when none is configured and the CLI exists", async () => {
-		const deps = makeDeps();
+	it("auto-registers the MCP server when none is configured (injected binary)", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
 		const hooks = createHooks(deps);
 		const cfg: Record<string, unknown> = {};
 		await hooks.config(cfg as never);
 		expect(hooks.__state()).toEqual({
 			enabled: true,
 			serverName: "jbcontext",
-			binPath: resolveBinaryPath(),
+			binPath: "/opt/jbcontext",
 		});
 		expect((cfg.mcp as Record<string, unknown>).jbcontext).toEqual({
 			type: "local",
-			command: [resolveBinaryPath(), "mcp"],
+			command: ["/opt/jbcontext", "mcp"],
 		});
+	});
+
+	it("auto-registers using the real resolver when deps.resolveBinary is not provided", async () => {
+		const deps = makeDeps();
+		const hooks = createHooks(deps);
+		const cfg: Record<string, unknown> = {};
+		await hooks.config(cfg as never);
+		const resolved = resolveBinaryPath();
+		if (resolved) {
+			// CLI installed on this machine: registered and enabled.
+			expect(hooks.__state()).toEqual({
+				enabled: true,
+				serverName: "jbcontext",
+				binPath: resolved,
+			});
+			expect((cfg.mcp as Record<string, unknown>).jbcontext).toEqual({
+				type: "local",
+				command: [resolved, "mcp"],
+			});
+		} else {
+			// CLI absent: single warning, inactive.
+			expect(hooks.__state()).toEqual({
+				enabled: false,
+				serverName: null,
+				binPath: null,
+			});
+			expect(deps.logCalls).toHaveLength(1);
+			expect(deps.logCalls[0].level).toBe("warn");
+		}
+	});
+
+	it("respects a disabled jbcontext-keyed entry (never override, even disabled)", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		const cfg = {
+			mcp: {
+				jbcontext: { type: "local", enabled: false, command: ["/old/jbcontext"] },
+			},
+		};
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: false,
+			serverName: null,
+			binPath: null,
+		});
+		// The user's entry is untouched.
+		expect(cfg.mcp.jbcontext).toEqual({
+			type: "local",
+			enabled: false,
+			command: ["/old/jbcontext"],
+		});
+		expect(deps.logCalls).toEqual([]);
 	});
 
 	it("warns once and stays inactive when the CLI is missing", async () => {
@@ -305,6 +389,50 @@ describe("createHooks config", () => {
 		Object.defineProperty(cfg, "mcp", {
 			get() {
 				throw new TypeError("hostile getter");
+			},
+			configurable: true,
+		});
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: false,
+			serverName: null,
+			binPath: null,
+		});
+		expect(deps.runIndexCalls).toEqual([]);
+	});
+
+	it("stays inactive when the mcp key is hostile during the disabled-key check", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		const cfg = {};
+		Object.defineProperty(cfg, "mcp", {
+			get() {
+				throw new TypeError("hostile getter");
+			},
+			configurable: true,
+		});
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: false,
+			serverName: null,
+			binPath: null,
+		});
+		expect(deps.runIndexCalls).toEqual([]);
+	});
+
+	it("stays inactive when the disabled-key check hits a hostile shape", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		// mcp is readable exactly once (findJbcontextServer consumes the first
+		// read and sees no jbcontext server); the second read, in the
+		// disabled-key check, throws.
+		let reads = 0;
+		const cfg = {};
+		Object.defineProperty(cfg, "mcp", {
+			get() {
+				reads += 1;
+				if (reads === 1) return {};
+				throw new TypeError("hostile on second read");
 			},
 			configurable: true,
 		});

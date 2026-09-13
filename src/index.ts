@@ -56,11 +56,23 @@ export const INSTALL_COMMAND =
 	"curl -fsSL https://download.jetbrains.com/jetbrains-context/release/download-jbcontext.sh | bash";
 
 /**
- * Resolve the jbcontext binary: bare `jbcontext` (PATH) first, then the
- * installer's default location. Returns null when neither exists.
+ * Resolve the jbcontext binary by walking `process.env.PATH` explicitly
+ * (accessSync on a bare name checks the process cwd, not PATH), then the
+ * installer's default location. Returns an absolute path, or null when the
+ * CLI is not installed. Check-time-only validation: the binary can still
+ * change between this check and any later spawn (opencode's MCP layer owns
+ * spawn failures).
  */
 export function resolveBinaryPath(): string | null {
-	for (const candidate of ["jbcontext", DEFAULT_BIN_PATH]) {
+	const pathEnv = process.env.PATH ?? "";
+	const candidates = [
+		...pathEnv
+			.split(":")
+			.filter(Boolean)
+			.map((dir) => `${dir}/jbcontext`),
+		DEFAULT_BIN_PATH,
+	];
+	for (const candidate of candidates) {
 		try {
 			accessSync(candidate, constants.X_OK);
 			return candidate;
@@ -142,7 +154,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 	 * CLI is the shared resource, so a burst of session creations for the same
 	 * repo (subagents spawning) must share one run regardless of session.
 	 */
-	const indexRepo = (bin: string, root: string, sessionID: string): Promise<string> => {
+	const indexRepo = (bin: string, root: string): Promise<string> => {
 		const key = root;
 
 		const existing = indexingPromises.get(key);
@@ -206,6 +218,21 @@ export function createHooks(deps: JbcontextPluginDeps) {
 				binPath = match.binPath;
 				return;
 			}
+			// No enabled jbcontext server. Before auto-registering, respect a
+			// user-configured entry under the "jbcontext" key even when it is
+			// disabled — an explicit "keep it off" decision must not be
+			// silently reversed.
+			try {
+				const existing = (cfg as { mcp?: Record<string, unknown> }).mcp;
+				if (existing && Object.prototype.hasOwnProperty.call(existing, "jbcontext")) {
+					enabled = false;
+					return;
+				}
+			} catch {
+				// Hostile config shape: stay inactive.
+				enabled = false;
+				return;
+			}
 			// No existing jbcontext server: auto-register one.
 			const resolved = (deps.resolveBinary ?? resolveBinaryPath)();
 			if (!resolved) {
@@ -242,7 +269,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 			const dir: string = info.directory;
 			try {
 				const root = await deps.getGitRoot(dir);
-				indexRepo(binPath, root, info.id).catch(async (err: unknown) => {
+				indexRepo(binPath, root).catch(async (err: unknown) => {
 					await deps.log(
 						"debug",
 						`jbcontext: background session-start indexing failed, proceeding without it`,
@@ -305,7 +332,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 						return "jbcontext-index plugin is not active (no enabled jbcontext MCP server found in config).";
 					}
 					const root = await deps.getGitRoot(context.directory);
-					return indexRepo(binPath, root, context.sessionID);
+					return indexRepo(binPath, root);
 				},
 			},
 		},

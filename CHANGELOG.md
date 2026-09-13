@@ -10,10 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Automatic MCP server registration: if no jbcontext MCP server is configured,
-  the plugin resolves the jbcontext binary (PATH, then the installer's default
-  `~/.jbcontext/bin/jbcontext`) and registers a `jbcontext` MCP entry on the
-  runtime config — spawned in the same session, no restart or config editing
-  needed. Existing jbcontext MCP entries are never overridden.
+  the plugin resolves the jbcontext binary (walking `PATH`, then the
+  installer's default `~/.jbcontext/bin/jbcontext`) and registers a
+  `jbcontext` MCP entry on the runtime config — spawned in the same session,
+  no restart or config editing needed. The registered command is always an
+  absolute path. Existing jbcontext MCP entries are never overridden —
+  including entries under the `jbcontext` key that the user explicitly
+  disabled.
 - Single warning with the official install command when the jbcontext CLI is
   not installed; the plugin stays inactive instead of spamming errors.
 - Background indexing on session creation (`session.created` event), mirroring
