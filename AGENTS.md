@@ -6,9 +6,11 @@ References:
 ## Project Overview
 
 This is an OpenCode plugin that keeps the current git repository indexed by
-JetBrains Context (jbcontext) for semantic code search. It indexes on session
-creation (mirroring jbcontext's Codex SessionStart hook), joins in-flight
-indexes before searches, and exposes a manual `jbcontext_index` tool.
+JetBrains Context (jbcontext) for semantic code search. It auto-registers the
+jbcontext MCP server when none is configured (never overriding existing
+entries), indexes on session creation (mirroring jbcontext's Codex
+SessionStart hook), joins in-flight indexes before searches, and exposes a
+manual `jbcontext_index` tool.
 
 ## Do
 
@@ -26,6 +28,7 @@ indexes before searches, and exposes a manual `jbcontext_index` tool.
 - Add indexing triggers beyond session creation and the manual tool without
   discussing first (the design is deliberately Codex-parity: index on
   session start, join-only before searches)
+- Override an existing jbcontext MCP entry in the user's config
 
 ## Commands
 

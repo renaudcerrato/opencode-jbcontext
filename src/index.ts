@@ -39,11 +39,36 @@
  * enabled jbcontext servers are configured.
  */
 
+import { accessSync, constants } from "node:fs";
+import { homedir } from "node:os";
 import type { Config, Plugin, PluginInput } from "@opencode-ai/plugin";
 
 /** Basename of a path (last segment after the final `/`). Avoids a node:path dependency. POSIX-only: on Windows, config paths use `/` in opencode's merged config. */
 export function basename(p: string): string {
 	return p.split("/").filter(Boolean).pop() ?? "";
+}
+
+/** Installer's default install location for the jbcontext CLI. */
+export const DEFAULT_BIN_PATH = `${homedir()}/.jbcontext/bin/jbcontext`;
+
+/** Official installer one-liner, shown when the CLI is missing. */
+export const INSTALL_COMMAND =
+	"curl -fsSL https://download.jetbrains.com/jetbrains-context/release/download-jbcontext.sh | bash";
+
+/**
+ * Resolve the jbcontext binary: bare `jbcontext` (PATH) first, then the
+ * installer's default location. Returns null when neither exists.
+ */
+export function resolveBinaryPath(): string | null {
+	for (const candidate of ["jbcontext", DEFAULT_BIN_PATH]) {
+		try {
+			accessSync(candidate, constants.X_OK);
+			return candidate;
+		} catch {
+			// Not usable; try the next candidate.
+		}
+	}
+	return null;
 }
 
 export type ServerMatch = {
@@ -94,6 +119,8 @@ export type JbcontextPluginDeps = {
 	getSessionDirectory: (sessionID: string) => Promise<string>;
 	/** Run jbcontext index. Throws on failure. Returns the CLI output. */
 	runIndex: (bin: string, root: string) => Promise<string>;
+	/** Resolve the jbcontext binary path, or null when not installed. */
+	resolveBinary?: () => string | null;
 };
 
 /**
@@ -150,10 +177,21 @@ export function createHooks(deps: JbcontextPluginDeps) {
 		/** Test visibility: whether the plugin is active and for which server. */
 		__state: () => ({ enabled, serverName, binPath }),
 
-		// Init: detect jbcontext server, throw on ambiguity, never throw on missing binary.
+		// Init: detect or register the jbcontext MCP server.
+		// - An existing enabled jbcontext server in the merged config wins
+		//   (never override user config).
+		// - Otherwise, resolve the binary (PATH, then the installer's default
+		//   location) and register a `jbcontext` MCP entry on the runtime
+		//   config — opencode initializes plugins before MCP servers, so the
+		//   registered entry is spawned in the same session.
+		// - When the CLI is missing entirely, warn once with the install
+		//   command and stay inactive.
 		config: async (cfg: Config) => {
-			const match = findJbcontextServer(cfg as unknown);
-			if (match.matchCount === 0) {
+			let match: ServerMatch;
+			try {
+				match = findJbcontextServer(cfg as unknown);
+			} catch {
+				// Hostile config shape (throwing getters): stay inactive.
 				enabled = false;
 				return;
 			}
@@ -162,9 +200,33 @@ export function createHooks(deps: JbcontextPluginDeps) {
 					`jbcontext-index plugin: multiple enabled jbcontext MCP servers found (${match.matchNames.join(", ")}); configure exactly one.`,
 				);
 			}
-			enabled = true;
-			serverName = match.serverName;
-			binPath = match.binPath;
+			if (match.matchCount === 1) {
+				enabled = true;
+				serverName = match.serverName;
+				binPath = match.binPath;
+				return;
+			}
+			// No existing jbcontext server: auto-register one.
+			const resolved = (deps.resolveBinary ?? resolveBinaryPath)();
+			if (!resolved) {
+				enabled = false;
+				await deps.log(
+					"warn",
+					`jbcontext: CLI not found (checked PATH and ${DEFAULT_BIN_PATH}); jbcontext MCP server not registered. Install it with: ${INSTALL_COMMAND}`,
+					{ decision: "cli-missing", installCommand: INSTALL_COMMAND },
+				);
+				return;
+			}
+			try {
+				const mcp = (cfg.mcp ??= {}) as Record<string, unknown>;
+				mcp.jbcontext = { type: "local", command: [resolved, "mcp"] };
+				enabled = true;
+				serverName = "jbcontext";
+				binPath = resolved;
+			} catch {
+				// Frozen/sealed config: skip registration, stay inactive.
+				enabled = false;
+			}
 		},
 
 		// Session creation: kick off a background index, Codex SessionStart-hook

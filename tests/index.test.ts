@@ -8,11 +8,15 @@
  * client/$ objects.
  */
 
+import fs from "node:fs";
 import {
 	basename,
 	createHooks,
 	findJbcontextServer,
+	INSTALL_COMMAND,
 	jbcontextPlugin,
+	DEFAULT_BIN_PATH,
+	resolveBinaryPath,
 	type JbcontextPluginDeps,
 } from "../src/index";
 
@@ -219,14 +223,107 @@ describe("findJbcontextServer", () => {
 });
 
 // ---------------------------------------------------------------------------
+// resolveBinaryPath
+// ---------------------------------------------------------------------------
+
+describe("resolveBinaryPath", () => {
+	const originalAccess = fs.accessSync;
+
+	afterEach(() => {
+		fs.accessSync = originalAccess;
+	});
+
+	it("returns the first usable candidate (PATH binary)", () => {
+		fs.accessSync = (p: any) => {
+			if (p === "jbcontext") return undefined;
+			throw new Error("ENOENT");
+		};
+		expect(resolveBinaryPath()).toBe("jbcontext");
+	});
+
+	it("falls back to the installer default path when PATH lacks the binary", () => {
+		fs.accessSync = (p: any) => {
+			if (p === DEFAULT_BIN_PATH) return undefined;
+			throw new Error("ENOENT");
+		};
+		expect(resolveBinaryPath()).toBe(DEFAULT_BIN_PATH);
+	});
+
+	it("returns null when no candidate is usable", () => {
+		fs.accessSync = () => {
+			throw new Error("ENOENT");
+		};
+		expect(resolveBinaryPath()).toBeNull();
+	});
+});
+
+// ---------------------------------------------------------------------------
 // createHooks — config hook
 // ---------------------------------------------------------------------------
 
 describe("createHooks config", () => {
-	it("stays disabled when no jbcontext server is configured", async () => {
+	it("auto-registers the MCP server when none is configured and the CLI exists", async () => {
 		const deps = makeDeps();
 		const hooks = createHooks(deps);
-		await hooks.config({} as never);
+		const cfg: Record<string, unknown> = {};
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: true,
+			serverName: "jbcontext",
+			binPath: resolveBinaryPath(),
+		});
+		expect((cfg.mcp as Record<string, unknown>).jbcontext).toEqual({
+			type: "local",
+			command: [resolveBinaryPath(), "mcp"],
+		});
+	});
+
+	it("warns once and stays inactive when the CLI is missing", async () => {
+		const deps = makeDeps({ resolveBinary: () => null });
+		const hooks = createHooks(deps);
+		const cfg: Record<string, unknown> = {};
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: false,
+			serverName: null,
+			binPath: null,
+		});
+		expect(cfg.mcp).toBeUndefined();
+		expect(deps.logCalls).toHaveLength(1);
+		expect(deps.logCalls[0].level).toBe("warn");
+		expect(deps.logCalls[0].message).toContain(INSTALL_COMMAND);
+		expect(deps.logCalls[0].extra).toEqual({
+			decision: "cli-missing",
+			installCommand: INSTALL_COMMAND,
+		});
+	});
+
+	it("stays inactive when the config shape is hostile (throwing getters)", async () => {
+		const deps = makeDeps();
+		const hooks = createHooks(deps);
+		const cfg = {};
+		Object.defineProperty(cfg, "mcp", {
+			get() {
+				throw new TypeError("hostile getter");
+			},
+			configurable: true,
+		});
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: false,
+			serverName: null,
+			binPath: null,
+		});
+		expect(deps.runIndexCalls).toEqual([]);
+	});
+
+	it("tolerates a frozen config when auto-registering", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		// A frozen config: mcp exists (empty) but is sealed against writes.
+		const cfg = { mcp: Object.freeze({}) as Record<string, unknown> };
+		// In strict mode, assigning to a frozen object throws.
+		await hooks.config(cfg as never);
 		expect(hooks.__state()).toEqual({
 			enabled: false,
 			serverName: null,
@@ -243,6 +340,14 @@ describe("createHooks config", () => {
 			serverName: "jbcontext",
 			binPath: "/usr/local/bin/jbcontext",
 		});
+	});
+
+	it("never overrides an existing jbcontext server", async () => {
+		const deps = makeDeps();
+		const hooks = createHooks(deps);
+		const cfg = JSON.parse(JSON.stringify(CONFIG_ONE)) as Record<string, any>;
+		await hooks.config(cfg as never);
+		expect(cfg.mcp.jbcontext.command).toEqual(["/usr/local/bin/jbcontext", "mcp"]);
 	});
 
 	it("throws when multiple enabled jbcontext servers are configured", async () => {

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Automatic MCP server registration: if no jbcontext MCP server is configured,
+  the plugin resolves the jbcontext binary (PATH, then the installer's default
+  `~/.jbcontext/bin/jbcontext`) and registers a `jbcontext` MCP entry on the
+  runtime config — spawned in the same session, no restart or config editing
+  needed. Existing jbcontext MCP entries are never overridden.
+- Single warning with the official install command when the jbcontext CLI is
+  not installed; the plugin stays inactive instead of spamming errors.
 - Background indexing on session creation (`session.created` event), mirroring
   jbcontext's Codex SessionStart hook (`jbcontext index --silent &`): the
   session never waits for indexing.
@@ -16,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-flight index (so the search sees fresh content) but never start one.
 - Manual `jbcontext_index` tool for on-demand re-indexing, forwarding the
   jbcontext CLI output (stdout + stderr) to the agent.
-- Concurrent index deduplication per session+repository.
+- Concurrent index deduplication per repository.
 - Worktree-aware directory resolution: the session's working directory is
   resolved through the OpenCode SDK, so worktree sessions index the correct
   repository root.

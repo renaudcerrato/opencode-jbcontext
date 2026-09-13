@@ -64,13 +64,20 @@ This plugin gives OpenCode the same treatment: the repository is indexed automat
 
 The plugin mirrors jbcontext's own Codex SessionStart hook (`jbcontext index --silent &`):
 
-1. **Session start** — when a session is created, the plugin resolves the session's git repository root and kicks off `jbcontext index` in the background (fire-and-forget). The session never waits for indexing.
-2. **Before a search** — when `jbcontext_code_search` runs, the plugin joins an in-flight index if one is running (so the search sees fresh content) but never starts one. Indexing is triggered by session start and the manual tool only.
-3. **On demand** — the `jbcontext_index` tool (below) runs a fresh index whenever the agent asks for one.
+1. **MCP registration** — if no jbcontext MCP server is configured, the plugin registers one automatically (resolving the binary from `PATH`, then the installer's default `~/.jbcontext/bin/jbcontext`). OpenCode initializes plugins before MCP servers, so the registered server is spawned in the same session — no restart, no config editing. An existing jbcontext MCP entry is never overridden.
+2. **Session start** — when a session is created, the plugin resolves the session's git repository root and kicks off `jbcontext index` in the background (fire-and-forget). The session never waits for indexing.
+3. **Before a search** — when `jbcontext_code_search` runs, the plugin joins an in-flight index if one is running (so the search sees fresh content) but never starts one. Indexing is triggered by session start and the manual tool only.
+4. **On demand** — the `jbcontext_index` tool (below) runs a fresh index whenever the agent asks for one.
 
-Concurrent index runs for the same session and repository are deduplicated: a caller that arrives while an index is running gets that run's output instead of spawning a second one.
+Concurrent index runs for the same repository are deduplicated: a caller that arrives while an index is running gets that run's output instead of spawning a second one.
 
 Worktree sessions index the correct repository root — the plugin resolves the session's working directory through the OpenCode SDK, not the startup directory.
+
+If the jbcontext CLI is not installed, the plugin logs a single warning with the install command and stays inactive:
+
+```sh
+curl -fsSL https://download.jetbrains.com/jetbrains-context/release/download-jbcontext.sh | bash
+```
 
 ## The `jbcontext_index` Tool
 
@@ -85,22 +92,10 @@ It takes no arguments, indexes the repository root of the current working direct
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) with the jbcontext MCP server configured:
+- [OpenCode](https://opencode.ai)
+- The [jbcontext CLI](https://jbcontext.com) installed and authenticated (`jbcontext login`) — the plugin registers the MCP server itself, but authentication is interactive and stays the user's job.
 
-  ```json
-  {
-    "mcp": {
-      "jbcontext": {
-        "type": "local",
-        "command": ["/path/to/jbcontext", "mcp"]
-      }
-    }
-  }
-  ```
-
-- The [jbcontext CLI](https://jbcontext.com) installed and authenticated (`jbcontext login`).
-
-The plugin self-gates: if no enabled jbcontext MCP server is found in the merged config (detected by binary basename), it stays inactive. Configuring more than one enabled jbcontext server is an error.
+The plugin self-gates: if the jbcontext binary cannot be found (neither on `PATH` nor at the installer's default location), it logs one warning and stays inactive. Configuring more than one enabled jbcontext MCP server is an error.
 
 ## Development
 
