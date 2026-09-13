@@ -1,9 +1,10 @@
 /**
  * OpenCode jbcontext plugin.
  *
- * Keeps the current git repository indexed by JetBrains Context (jbcontext)
- * so the `jbcontext_code_search` MCP tool always has a fresh index, and
- * exposes a manual `jbcontext_index` tool for on-demand re-indexing.
+ * Keeps the current project directory indexed by JetBrains Context
+ * (jbcontext) so the `jbcontext_code_search` MCP tool always has a fresh
+ * index, and exposes a manual `jbcontext_index` tool for on-demand
+ * re-indexing.
  *
  * Behavior (mirrors jbcontext's own Codex SessionStart hook, which runs
  * `jbcontext index --silent &` on session start):
@@ -14,12 +15,14 @@
  * - The `jbcontext_index` tool indexes on demand and forwards the jbcontext
  *   CLI output (stdout + stderr) back to the agent so indexing progress,
  *   warnings, and diagnostics are visible.
- * - Concurrent index runs for the same repository are deduplicated (the
- *   caller gets the in-flight run's output instead of spawning a second one).
+ * - Concurrent index runs for the same directory are deduplicated (the
+ *   caller gets the in-flight run's output instead of spawning a second
+ *   one). jbcontext resolves the git root itself when the directory is
+ *   inside one — the plugin passes the directory as-is and stays git-free.
  *
  * Directory resolution:
  * - The session-created hook uses the event's `info.directory`, so worktree
- *   sessions index the correct repo root rather than the init-time project
+ *   sessions index their own checkout rather than the init-time project
  *   directory.
  * - The pre-search hook resolves the session's working directory from
  *   `sessionID` via the opencode SDK (client.session.get), falling back to
@@ -145,11 +148,6 @@ export type Log = (
 export type JbcontextPluginDeps = {
 	/** Structured log via the opencode SDK. */
 	log: Log;
-	/**
-	 * Resolve the index root for a directory: git repo root when available,
-	 * the directory itself otherwise (git optional). Never throws.
-	 */
-	getGitRoot: (cwd: string) => Promise<string>;
 	/** Resolve the working directory for a session (SDK lookup with fallback). */
 	getSessionDirectory: (sessionID: string) => Promise<string>;
 	/** Run jbcontext index. Throws on failure. Returns the CLI output. */
@@ -167,15 +165,16 @@ export function createHooks(deps: JbcontextPluginDeps) {
 	let enabled = false;
 	let serverName: string | null = null;
 	let binPath: string | null = null;
-	// in-flight index promises keyed by repo root (resolves to CLI output)
+	// in-flight index promises keyed by directory path (resolves to CLI output)
 	const indexingPromises = new Map<string, Promise<string>>();
 
 	/**
-	 * Index the repo, deduplicating concurrent runs for the same repository
+	 * Index the directory, deduplicating concurrent runs for the same path
 	 * (a caller joining an in-flight run gets that run's output). Always
-	 * indexes — there is no throttle window. Keyed by repo alone: the jbcontext
-	 * CLI is the shared resource, so a burst of session creations for the same
-	 * repo (subagents spawning) must share one run regardless of session.
+	 * indexes — there is no throttle window. Keyed by directory alone: a
+	 * burst of session creations for the same directory (subagents spawning)
+	 * must share one run regardless of session. jbcontext resolves the git
+	 * root itself when the directory is inside one.
 	 */
 	const indexRepo = (bin: string, root: string): Promise<string> => {
 		const key = root;
@@ -199,9 +198,9 @@ export function createHooks(deps: JbcontextPluginDeps) {
 	};
 
 	/**
-	 * Join an in-flight index for the repo if one is running. Never starts a
-	 * new index — indexing is triggered by session creation and the manual
-	 * tool only (Codex SessionStart-hook parity).
+	 * Join an in-flight index for the directory if one is running. Never
+	 * starts a new index — indexing is triggered by session creation and the
+	 * manual tool only (Codex SessionStart-hook parity).
 	 */
 	const joinIndex = (root: string): Promise<string> => {
 		const existing = indexingPromises.get(root);
@@ -323,40 +322,25 @@ export function createHooks(deps: JbcontextPluginDeps) {
 		// Session creation: kick off a background index, Codex SessionStart-hook
 		// style. Fire-and-forget — never awaited, never blocks the session.
 		// Routed through indexRepo so concurrent session creations for the same
-		// repo (subagent bursts) share one run, and so pre-search joins can see
-		// the in-flight session-start index.
+		// directory (subagent bursts) share one run, and so pre-search joins
+		// can see the in-flight session-start index.
 		event: async ({ event }: { event: { type: string; properties: any } }) => {
 			if (!enabled || !serverName || !binPath) return;
 			if (event.type !== "session.created") return;
 			const info = event.properties?.info;
 			if (!info?.directory) return;
 			const dir: string = info.directory;
-			try {
-				const root = await deps.getGitRoot(dir);
-				indexRepo(binPath, root).catch(async (err: unknown) => {
-					await deps.log(
-						"debug",
-						`jbcontext: background session-start indexing failed, proceeding without it`,
-						{
-							root,
-							sessionID: info.id,
-							error: err instanceof Error ? err.message : String(err),
-						},
-					);
-				});
-			} catch (err) {
-				// getGitRoot no longer throws for non-git dirs; this only fires
-				// on unexpected internal errors.
+			indexRepo(binPath, dir).catch(async (err: unknown) => {
 				await deps.log(
 					"debug",
-					`jbcontext: could not resolve index root at session start, skipping background index`,
+					`jbcontext: background session-start indexing failed, proceeding without it`,
 					{
-						directory: dir,
+						root: dir,
 						sessionID: info.id,
 						error: err instanceof Error ? err.message : String(err),
 					},
 				);
-			}
+			});
 		},
 
 		// Lazy: fires before every tool call; only acts on ${serverName}_code_search.
@@ -369,8 +353,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 
 			try {
 				const dir = await deps.getSessionDirectory(input.sessionID);
-				const root = await deps.getGitRoot(dir);
-				await joinIndex(root);
+				await joinIndex(dir);
 			} catch (err) {
 				await deps.log(
 					"error",
@@ -384,12 +367,11 @@ export function createHooks(deps: JbcontextPluginDeps) {
 			}
 		},
 
-		// Manual tool: index the current directory on demand (git optional —
-		// non-git directories are indexed as plain directories).
+		// Manual tool: index the current directory on demand.
 		tool: {
 			jbcontext_index: {
 				description:
-					"Run a fresh jbcontext index of the current project directory. Use this to refresh the semantic search index after making code changes, before re-running jbcontext_code_search. Takes no arguments — indexes the current working directory (the git repository root when inside one, the directory itself otherwise).",
+					"Run a fresh jbcontext index of the current project directory. Use this to refresh the semantic search index after making code changes, before re-running jbcontext_code_search. Takes no arguments — indexes the current working directory.",
 				args: {},
 				async execute(
 					_args: Record<string, never>,
@@ -398,8 +380,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 					if (!enabled || !binPath) {
 						return "jbcontext-index plugin is not active (no enabled jbcontext MCP server found in config).";
 					}
-					const root = await deps.getGitRoot(context.directory);
-					return indexRepo(binPath, root);
+					return indexRepo(binPath, context.directory);
 				},
 			},
 		},
@@ -412,11 +393,6 @@ export const jbcontextPlugin: Plugin = async ({
 	directory,
 }: PluginInput) => {
 	// --- state (per opencode process) ---
-	// index-root cache keyed by cwd (git root when available, the directory
-	// itself otherwise). Unbounded by design: bounded in practice by the
-	// number of distinct working directories seen per opencode process. The
-	// cache also makes the git-missing warning fire at most once per cwd.
-	const gitRootCache = new Map<string, string>();
 	// session directory cache keyed by sessionID. Unbounded by design: bounded
 	// in practice by the number of sessions per opencode process.
 	const sessionDirCache = new Map<string, string>();
@@ -429,53 +405,6 @@ export const jbcontextPlugin: Plugin = async ({
 			})
 			.catch(() => {});
 		return Promise.resolve();
-	};
-
-	/**
-	 * Resolve the index root for a directory: the git repository root when
-	 * the directory is inside one, the directory itself otherwise. Git is
-	 * optional — jbcontext indexes non-git directories (deriving its own
-	 * stable repository id from the path).
-	 *
-	 * Classification from the rev-parse result:
-	 * - git binary missing (exit 127 / "command not found") → warn once per
-	 *   directory, fall back to the directory itself.
-	 * - anything else (not a repo, permission, …) → debug, fall back to the
-	 *   directory itself.
-	 */
-	const resolveIndexRoot = async (cwd: string): Promise<string> => {
-		const cached = gitRootCache.get(cwd);
-		if (cached) return cached;
-		const out = await $`git -C ${cwd} rev-parse --show-toplevel`.nothrow().quiet();
-		const root = out.stdout.toString().trim();
-		if (out.exitCode === 0 && root) {
-			gitRootCache.set(cwd, root);
-			return root;
-		}
-		const stderr = out.stderr.toString().trim();
-		const gitMissing =
-			out.exitCode === 127 ||
-			/command not found:?\s*git\b/i.test(stderr) ||
-			/\bgit\b:?\s*command not found/i.test(stderr) ||
-			/No such file or directory.*\bgit\b/i.test(stderr);
-		if (gitMissing) {
-			// Warn per directory: the index-root cache guarantees this
-			// classification runs at most once per cwd for sequential calls
-			// (concurrent first calls may both warn — cosmetic only).
-			await log(
-				"warn",
-				`jbcontext: git is not installed or not on PATH; indexing "${cwd}" as a plain directory (repo-root canonicalization disabled). Install git for repository-aware indexing.`,
-				{ directory: cwd, decision: "git-missing" },
-			);
-		} else {
-			await log(
-				"debug",
-				`jbcontext: "${cwd}" is not inside a git repository; indexing it as a plain directory`,
-				{ directory: cwd, decision: "non-git" },
-			);
-		}
-		gitRootCache.set(cwd, cwd);
-		return cwd;
 	};
 
 	/**
@@ -543,7 +472,6 @@ export const jbcontextPlugin: Plugin = async ({
 
 	return createHooks({
 		log,
-		getGitRoot: resolveIndexRoot,
 		getSessionDirectory,
 		runIndex,
 	});

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Git-free by design: the plugin passes the session's working directory to
+  jbcontext as-is — no git invocation, no repo-root resolution. jbcontext
+  resolves the git root itself for repositories and derives a stable
+  repository id from the path for plain directories.
 - Automatic MCP server registration: if no jbcontext MCP server is configured,
   the plugin resolves the jbcontext binary (walking `PATH`, then the
   installer's default `~/.jbcontext/bin/jbcontext`) and registers a
@@ -19,11 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overridden — including explicitly disabled entries, matched by binary
   basename regardless of their config key, and any entry under the literal
   `jbcontext` key regardless of type.
-- Git-optional indexing: inside a git repository the repo root is indexed
-  (canonicalizing subdirectories and worktrees); outside one — or when git
-  is not installed — the directory itself is indexed (jbcontext derives a
-  stable repository id from the path). A missing git binary logs one
-  warning per directory; non-git directories log at debug.
 - Single warning with the official install command when the jbcontext CLI is
   not installed; the plugin stays inactive instead of spamming errors.
 - Background indexing on session creation (`session.created` event), mirroring

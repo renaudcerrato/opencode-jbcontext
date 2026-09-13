@@ -5,12 +5,13 @@ References:
 
 ## Project Overview
 
-This is an OpenCode plugin that keeps the current git repository indexed by
+This is an OpenCode plugin that keeps the current project directory indexed by
 JetBrains Context (jbcontext) for semantic code search. It auto-registers the
 jbcontext MCP server when none is configured (never overriding existing
 entries), indexes on session creation (mirroring jbcontext's Codex
 SessionStart hook), joins in-flight indexes before searches, and exposes a
-manual `jbcontext_index` tool.
+manual `jbcontext_index` tool. Git-free: the session directory is passed to
+jbcontext as-is; jbcontext resolves git roots itself.
 
 ## Do
 
