@@ -232,7 +232,11 @@ describe("resolveBinaryPath", () => {
 
 	afterEach(() => {
 		fs.accessSync = originalAccess;
-		process.env.PATH = originalPath;
+		if (originalPath === undefined) {
+			delete process.env.PATH;
+		} else {
+			process.env.PATH = originalPath;
+		}
 	});
 
 	it("walks PATH directories in order and returns the first hit", () => {
@@ -270,6 +274,26 @@ describe("resolveBinaryPath", () => {
 			throw new Error("ENOENT");
 		};
 		expect(resolveBinaryPath()).toBe("/first/bin/jbcontext");
+	});
+
+	it("skips relative PATH directories (never resolves against cwd)", () => {
+		process.env.PATH = "relative/bin:/first/bin";
+		fs.accessSync = (p: any) => {
+			// A repo-controlled relative candidate would be usable — it must
+			// never be consulted.
+			if (p === "relative/bin/jbcontext") return undefined;
+			if (p === "/first/bin/jbcontext") return undefined;
+			throw new Error("ENOENT");
+		};
+		expect(resolveBinaryPath()).toBe("/first/bin/jbcontext");
+	});
+
+	it("returns null when PATH has only relative dirs and the default is missing", () => {
+		process.env.PATH = "relative/bin";
+		fs.accessSync = () => {
+			throw new Error("ENOENT");
+		};
+		expect(resolveBinaryPath()).toBeNull();
 	});
 
 	it("returns null when no candidate is usable", () => {

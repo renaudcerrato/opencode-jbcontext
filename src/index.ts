@@ -14,7 +14,7 @@
  * - The `jbcontext_index` tool indexes on demand and forwards the jbcontext
  *   CLI output (stdout + stderr) back to the agent so indexing progress,
  *   warnings, and diagnostics are visible.
- * - Concurrent index runs for the same session+repo are deduplicated (the
+ * - Concurrent index runs for the same repository are deduplicated (the
  *   caller gets the in-flight run's output instead of spawning a second one).
  *
  * Directory resolution:
@@ -69,6 +69,10 @@ export function resolveBinaryPath(): string | null {
 		...pathEnv
 			.split(":")
 			.filter(Boolean)
+			// POSIX shells treat an empty segment as cwd; skipping it (and any
+			// relative dir) keeps every candidate absolute and eliminates the
+			// cwd channel entirely.
+			.filter((dir) => dir.startsWith("/"))
 			.map((dir) => `${dir}/jbcontext`),
 		DEFAULT_BIN_PATH,
 	];
@@ -144,7 +148,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 	let enabled = false;
 	let serverName: string | null = null;
 	let binPath: string | null = null;
-	// in-flight index promises keyed by `${sessionID}:${root}` (resolves to CLI output)
+	// in-flight index promises keyed by repo root (resolves to CLI output)
 	const indexingPromises = new Map<string, Promise<string>>();
 
 	/**
