@@ -707,6 +707,299 @@ describe("createHooks event", () => {
 		expect(runCount).toBe(1);
 	});
 
+	it("manual tool joins a session-start index for the same repo (cross-entry-point dedupe)", async () => {
+		const gate = deferred<string>();
+		let runCount = 0;
+		const deps = makeDeps({
+			runIndex: async () => {
+				runCount += 1;
+				return gate.promise;
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		// Session-start index begins (fire-and-forget, minutes-long in reality).
+		await hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
+		expect(runCount).toBe(1);
+
+		// The user asks for a refresh; the manual tool must join the
+		// in-flight session-start run, not spawn a second one.
+		const manual = hooks.tool.jbcontext_index.execute(
+			{},
+			{ directory: "/repo", sessionID: "s2" },
+		);
+		gate.resolve("session-start output");
+		const output = await manual;
+		expect(runCount).toBe(1);
+		expect(output).toBe("session-start output");
+	});
+
+	it("clears the in-flight entry after a failed run (no poisoned dedupe cache)", async () => {
+		let runCount = 0;
+		const deps = makeDeps({
+			runIndex: async () => {
+				runCount += 1;
+				if (runCount === 1) throw new Error("auth expired");
+				return `fresh index ${runCount}`;
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		// First run fails.
+		await expect(
+			hooks.tool.jbcontext_index.execute({}, { directory: "/repo", sessionID: "s1" }),
+		).rejects.toThrow("auth expired");
+
+		// A later retry must spawn a NEW run, not re-throw the cached rejection.
+		const output = await hooks.tool.jbcontext_index.execute(
+			{},
+			{ directory: "/repo", sessionID: "s1" },
+		);
+		expect(runCount).toBe(2);
+		expect(output).toBe("fresh index 2");
+	});
+
+	it("gates pre-search on the configured server key, not a hardcoded name", async () => {
+		const gate = deferred<string>();
+		let runCount = 0;
+		const deps = makeDeps({
+			runIndex: async () => {
+				runCount += 1;
+				return gate.promise;
+			},
+		});
+		const hooks = createHooks(deps);
+		// Server registered under a custom key — basename matching is
+		// advertised as "server name irrelevant".
+		const config = {
+			mcp: {
+				"jetbrains-context": { type: "local", command: ["/bin/jbcontext"] },
+			},
+		};
+		await hooks.config(config as never);
+		expect(hooks.__state().serverName).toBe("jetbrains-context");
+
+		// Start an in-flight index via the manual tool.
+		const manual = hooks.tool.jbcontext_index.execute(
+			{},
+			{ directory: "/repo", sessionID: "s1" },
+		);
+
+		// A search named after the custom key joins the in-flight index.
+		const join = hooks["tool.execute.before"]({
+			tool: "jetbrains-context_code_search",
+			sessionID: "s1",
+		} as never);
+		// A search named after the default key does not block on it.
+		const nonJoin = hooks["tool.execute.before"]({
+			tool: "jbcontext_code_search",
+			sessionID: "s2",
+		} as never);
+		await nonJoin;
+		gate.resolve("done");
+		await Promise.all([manual, join, gate.promise]);
+		expect(runCount).toBe(1);
+	});
+
+	it("detects wrapper-script commands (npx/env launchers) and adopts them", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		const cfg = {
+			mcp: {
+				"jetbrains-context": { type: "local", command: ["npx", "jbcontext", "mcp"] },
+			},
+		};
+		await hooks.config(cfg as never);
+		// The wrapper server is detected and adopted — no duplicate registered.
+		expect(hooks.__state()).toEqual({
+			enabled: true,
+			serverName: "jetbrains-context",
+			binPath: "npx",
+		});
+		expect(Object.keys(cfg.mcp)).toEqual(["jetbrains-context"]);
+	});
+
+	it("detects env-wrapper commands at argv[1]", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		const cfg = {
+			mcp: {
+				jb: { type: "local", command: ["/usr/bin/env", "jbcontext", "mcp"] },
+			},
+		};
+		await hooks.config(cfg as never);
+		expect(hooks.__state()).toEqual({
+			enabled: true,
+			serverName: "jb",
+			binPath: "/usr/bin/env",
+		});
+	});
+
+	it("indexes two different repos concurrently (cross-repo isolation)", async () => {
+		const gates = new Map<string, ReturnType<typeof deferred<string>>>();
+		const runRoots: string[] = [];
+		const deps = makeDeps({
+			runIndex: async (_bin: string, root: string) => {
+				runRoots.push(root);
+				const gate = deferred<string>();
+				gates.set(root, gate);
+				return gate.promise;
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		// Two sessions in different repos start indexes simultaneously.
+		await hooks.event({ event: sessionCreatedEvent("s1", "/repoA") } as never);
+		await hooks.event({ event: sessionCreatedEvent("s2", "/repoB") } as never);
+		expect(runRoots.sort()).toEqual(["/git/repoA", "/git/repoB"]);
+
+		// Resolving repo A's index does not affect repo B's pending run.
+		gates.get("/git/repoA")!.resolve("a done");
+		await gates.get("/git/repoA")!.promise;
+		expect(gates.get("/git/repoB")!.promise).toBeInstanceOf(Promise);
+		gates.get("/git/repoB")!.resolve("b done");
+		await gates.get("/git/repoB")!.promise;
+	});
+
+	it("dedupes different directories resolving to the same git root", async () => {
+		const gate = deferred<string>();
+		let runCount = 0;
+		const deps = makeDeps({
+			// Both directories live in the same repository.
+			getGitRoot: async (cwd: string) => "/git/repo",
+			runIndex: async () => {
+				runCount += 1;
+				return gate.promise;
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		const first = hooks.tool.jbcontext_index.execute(
+			{},
+			{ directory: "/repo", sessionID: "s1" },
+		);
+		const second = hooks.tool.jbcontext_index.execute(
+			{},
+			{ directory: "/repo/packages/app", sessionID: "s2" },
+		);
+		gate.resolve("done");
+		const [out1, out2] = await Promise.all([first, second]);
+		expect(runCount).toBe(1);
+		expect(out2).toBe(out1);
+	});
+
+	it("is idempotent when the config hook runs twice on the same config", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		const cfg: Record<string, unknown> = {};
+		await hooks.config(cfg as never);
+		await hooks.config(cfg as never);
+		// Second call re-detects the registered entry and stays enabled —
+		// no duplicate write, no warning.
+		expect(hooks.__state()).toEqual({
+			enabled: true,
+			serverName: "jbcontext",
+			binPath: "/opt/jbcontext",
+		});
+		expect(Object.keys(cfg.mcp as Record<string, unknown>)).toEqual(["jbcontext"]);
+		expect(deps.logCalls).toEqual([]);
+	});
+
+	it("registers on a second config call after a failed first registration", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		// First call: frozen config, registration fails.
+		const frozen = { mcp: Object.freeze({}) as Record<string, unknown> };
+		await hooks.config(frozen as never);
+		expect(hooks.__state().enabled).toBe(false);
+		// Second call: writable config, registration succeeds.
+		const writable: Record<string, unknown> = {};
+		await hooks.config(writable as never);
+		expect(hooks.__state()).toEqual({
+			enabled: true,
+			serverName: "jbcontext",
+			binPath: "/opt/jbcontext",
+		});
+	});
+
+	it("search joining an in-flight index that fails resolves without throwing", async () => {
+		const gate = deferred<string>();
+		const deps = makeDeps({
+			// Both the session-start event and the search resolve to the same root.
+			getGitRoot: async () => "/git/repo",
+			runIndex: async () => gate.promise,
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		// Session-start index begins; a search joins it.
+		await hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
+		const search = hooks["tool.execute.before"]({
+			tool: "jbcontext_code_search",
+			sessionID: "s1",
+		} as never);
+
+		// The in-flight index fails — the joiner must not throw.
+		gate.reject(new Error("auth expired"));
+		await expect(search).resolves.toBeUndefined();
+		// Allow the fire-and-forget .catch handler to run.
+		await new Promise((r) => setImmediate(r));
+		// The failure is logged exactly once (by the session-start .catch).
+		const failureLogs = deps.logCalls.filter((c) =>
+			c.message.includes("background session-start indexing failed"),
+		);
+		expect(failureLogs).toHaveLength(1);
+	});
+
+	it("pre-search join waits unboundedly for the in-flight index (no timeout)", async () => {
+		const gate = deferred<string>();
+		const deps = makeDeps({
+			// Both the session-start event and the search resolve to the same root.
+			getGitRoot: async () => "/git/repo",
+			runIndex: async () => gate.promise,
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		// Session-start index begins; a search joins it.
+		await hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
+		const search = hooks["tool.execute.before"]({
+			tool: "jbcontext_code_search",
+			sessionID: "s1",
+		} as never);
+
+		// The join is still pending after a tick (no timeout fires).
+		await new Promise((r) => setImmediate(r));
+		let settled = false;
+		void search.then(() => {
+			settled = true;
+		});
+		await new Promise((r) => setImmediate(r));
+		expect(settled).toBe(false);
+
+		// Releasing the gate resolves the search immediately.
+		gate.resolve("done");
+		await expect(search).resolves.toBeUndefined();
+	});
+
+	it("ignores a non-executable file squatting a PATH slot (X_OK check)", () => {
+		process.env.PATH = "/squat/bin:/real/bin";
+		fs.accessSync = (p: any, mode?: number) => {
+			if (p === "/squat/bin/jbcontext") {
+				const error: NodeJS.ErrnoException = new Error("EACCES: permission denied");
+				error.code = "EACCES";
+				throw error;
+			}
+			if (p === "/real/bin/jbcontext" && mode === fs.constants.X_OK) return undefined;
+			throw new Error("ENOENT");
+		};
+		expect(resolveBinaryPath()).toBe("/real/bin/jbcontext");
+	});
+
 	it("ignores malformed session.created events without info.directory", async () => {
 		const deps = makeDeps();
 		const hooks = createHooks(deps);
@@ -758,7 +1051,7 @@ describe("createHooks event", () => {
 		expect(deps.logCalls).toContainEqual(
 			expect.objectContaining({
 				level: "debug",
-				message: expect.stringContaining("could not resolve git root at session start"),
+				message: expect.stringContaining("could not resolve index root at session start"),
 				extra: expect.objectContaining({
 					directory: "/repo",
 					sessionID: "s1",
@@ -1006,6 +1299,128 @@ describe("createHooks jbcontext_index tool", () => {
 // ---------------------------------------------------------------------------
 
 describe("jbcontextPlugin", () => {
+	it("forwards stderr-only success output to the caller", async () => {
+		const logCalls: LogCall[] = [];
+		const client = makeClient(logCalls, { s1: "/session/dir" });
+		const { $ } = makeShell({
+			"git -C /session/dir rev-parse --show-toplevel": {
+				stdout: "/git/root\n",
+				stderr: "",
+				exitCode: 0,
+			},
+			"/usr/local/bin/jbcontext index --project-path=/git/root": {
+				stdout: "",
+				stderr: "warning: legacy flag",
+				exitCode: 0,
+			},
+		});
+
+		const plugin = await jbcontextPlugin({
+			client: client as never,
+			$,
+			directory: "/init/dir",
+		} as never);
+
+		await plugin.config(CONFIG_ONE as never);
+
+		const result = await (
+			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
+		)({} as never, { directory: "/session/dir", sessionID: "s1" } as never);
+		expect(result).toBe("warning: legacy flag");
+	});
+
+	it("preserves multiline stdout in forwarded output", async () => {
+		const logCalls: LogCall[] = [];
+		const client = makeClient(logCalls, { s1: "/session/dir" });
+		const { $ } = makeShell({
+			"git -C /session/dir rev-parse --show-toplevel": {
+				stdout: "/git/root\n",
+				stderr: "",
+				exitCode: 0,
+			},
+			"/usr/local/bin/jbcontext index --project-path=/git/root": {
+				stdout: "line1\nline2\nline3",
+				stderr: "",
+				exitCode: 0,
+			},
+		});
+
+		const plugin = await jbcontextPlugin({
+			client: client as never,
+			$,
+			directory: "/init/dir",
+		} as never);
+
+		await plugin.config(CONFIG_ONE as never);
+
+		const result = await (
+			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
+		)({} as never, { directory: "/session/dir", sessionID: "s1" } as never);
+		expect(result).toBe("line1\nline2\nline3");
+	});
+
+	it("falls back to the init directory when session.get returns null data", async () => {
+		const logCalls: LogCall[] = [];
+		const client = {
+			app: {
+				log: async (input: { body: LogCall }) => {
+					logCalls.push(input.body);
+				},
+			},
+			session: {
+				get: async () => ({ data: null }),
+			},
+		};
+		const { $, shellCalls } = makeShell({
+			"git -C /init/dir rev-parse --show-toplevel": {
+				stdout: "/git/init\n",
+				stderr: "",
+				exitCode: 0,
+			},
+			"/usr/local/bin/jbcontext index --project-path=/git/init": {
+				stdout: "",
+				stderr: "",
+				exitCode: 0,
+			},
+		});
+
+		const plugin = await jbcontextPlugin({
+			client: client as never,
+			$,
+			directory: "/init/dir",
+		} as never);
+
+		await plugin.config(CONFIG_ONE as never);
+
+		const manual = (
+			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
+		)({} as never, { directory: "/init/dir", sessionID: "manual" } as never);
+		const search = plugin["tool.execute.before"]({
+			tool: "jbcontext_code_search",
+			sessionID: "s1",
+		} as never);
+		await Promise.all([manual, search]);
+
+		expect(shellCalls[0]).toBe("git -C /init/dir rev-parse --show-toplevel");
+		expect(logCalls).toContainEqual(
+			expect.objectContaining({
+				level: "warn",
+				message: expect.stringContaining("has no directory"),
+			}),
+		);
+	});
+
+	it("ignores session.created events with an empty-string directory", async () => {
+		const deps = makeDeps();
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+		await hooks.event({
+			event: { type: "session.created", properties: { info: { id: "s1", directory: "" } } },
+		} as never);
+		expect(deps.gitRootCalls).toEqual([]);
+		expect(deps.runIndexCalls).toEqual([]);
+	});
+
 	function makeClient(logCalls: LogCall[], sessionDirs: Record<string, string>) {
 		return {
 			app: {
@@ -1319,14 +1734,19 @@ describe("jbcontextPlugin", () => {
 		);
 	});
 
-	it("throws a descriptive error when the git root cannot be resolved", async () => {
+	it("falls back to the directory itself when it is not a git repository", async () => {
 		const logCalls: LogCall[] = [];
 		const client = makeClient(logCalls, { s1: "/session/dir" });
-		const { $ } = makeShell({
+		const { $, shellCalls } = makeShell({
 			"git -C /session/dir rev-parse --show-toplevel": {
 				stdout: "",
 				stderr: "fatal: not a git repository",
 				exitCode: 128,
+			},
+			"/usr/local/bin/jbcontext index --project-path=/session/dir": {
+				stdout: "indexed plain dir",
+				stderr: "",
+				exitCode: 0,
 			},
 		});
 
@@ -1338,37 +1758,36 @@ describe("jbcontextPlugin", () => {
 
 		await plugin.config(CONFIG_ONE as never);
 
-		// The manual tool propagates the git-root failure.
-		await expect(
-			(plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>)(
-				{} as never,
-				{ directory: "/session/dir", sessionID: "s1" } as never,
-			),
-		).rejects.toThrow(/could not determine git root/);
+		// The manual tool indexes the directory itself (git optional).
+		const result = await (
+			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
+		)({} as never, { directory: "/session/dir", sessionID: "s1" } as never);
+		expect(result).toBe("indexed plain dir");
+		expect(shellCalls).toContain("jbcontext index --project-path=/session/dir".replace("jbcontext", "/usr/local/bin/jbcontext"));
 
-		// A search for the same session joins nothing (no in-flight index) and
-		// logs the swallowed git-root failure.
-		await plugin["tool.execute.before"]({
-			tool: "jbcontext_code_search",
-			sessionID: "s1",
-		} as never);
-
+		// Non-git classification is logged at debug.
 		expect(logCalls).toContainEqual(
 			expect.objectContaining({
-				level: "error",
-				message: expect.stringContaining("pre-search indexing failed"),
+				level: "debug",
+				message: expect.stringContaining("not inside a git repository"),
 				extra: expect.objectContaining({
-					error: expect.stringContaining("could not determine git root"),
+					directory: "/session/dir",
+					decision: "non-git",
 				}),
 			}),
 		);
 	});
 
-	it("throws a descriptive error when git output is empty but successful", async () => {
+	it("falls back to the directory itself when git output is empty but successful", async () => {
 		const logCalls: LogCall[] = [];
 		const client = makeClient(logCalls, { s1: "/session/dir" });
-		const { $ } = makeShell({
+		const { $, shellCalls } = makeShell({
 			"git -C /session/dir rev-parse --show-toplevel": {
+				stdout: "",
+				stderr: "",
+				exitCode: 0,
+			},
+			"/usr/local/bin/jbcontext index --project-path=/session/dir": {
 				stdout: "",
 				stderr: "",
 				exitCode: 0,
@@ -1383,24 +1802,101 @@ describe("jbcontextPlugin", () => {
 
 		await plugin.config(CONFIG_ONE as never);
 
-		await expect(
-			(plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>)(
-				{} as never,
-				{ directory: "/session/dir", sessionID: "s1" } as never,
-			),
-		).rejects.toThrow(/could not determine git root/);
+		const result = await (
+			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
+		)({} as never, { directory: "/session/dir", sessionID: "s1" } as never);
+		expect(result).toMatch(/^jbcontext: indexed \/session\/dir in \d+ms$/);
+		expect(shellCalls).toContain("/usr/local/bin/jbcontext index --project-path=/session/dir");
+	});
 
-		// A search for the same session logs the swallowed git-root failure.
-		await plugin["tool.execute.before"]({
-			tool: "jbcontext_code_search",
-			sessionID: "s1",
+	it("warns once per directory when the git binary is missing and falls back", async () => {
+		const logCalls: LogCall[] = [];
+		const client = makeClient(logCalls, { s1: "/session/dir" });
+		const { $, shellCalls } = makeShell({
+			"git -C /session/dir rev-parse --show-toplevel": {
+				stdout: "",
+				stderr: "bun: command not found: git",
+				exitCode: 127,
+			},
+			"git -C /session/dir2 rev-parse --show-toplevel": {
+				stdout: "",
+				stderr: "bun: command not found: git",
+				exitCode: 127,
+			},
+			"/usr/local/bin/jbcontext index --project-path=/session/dir": {
+				stdout: "",
+				stderr: "",
+				exitCode: 0,
+			},
+			"/usr/local/bin/jbcontext index --project-path=/session/dir2": {
+				stdout: "",
+				stderr: "",
+				exitCode: 0,
+			},
+		});
+
+		const plugin = await jbcontextPlugin({
+			client: client as never,
+			$,
+			directory: "/init/dir",
 		} as never);
+
+		await plugin.config(CONFIG_ONE as never);
+
+		// Two manual index calls for the same directory: the warn fires once.
+		await (
+			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
+		)({} as never, { directory: "/session/dir", sessionID: "s1" } as never);
+		await (
+			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
+		)({} as never, { directory: "/session/dir", sessionID: "s1" } as never);
+		// A different directory gets its own warn (once per directory).
+		await (
+			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
+		)({} as never, { directory: "/session/dir2", sessionID: "s1" } as never);
+
+		const warns = logCalls.filter(
+			(c) => c.level === "warn" && c.extra.decision === "git-missing",
+		);
+		expect(warns).toHaveLength(2);
+		expect(warns[0].extra.directory).toBe("/session/dir");
+		expect(warns[1].extra.directory).toBe("/session/dir2");
+		expect(warns[0].message).toContain("git is not installed");
+		expect(shellCalls).toContain("/usr/local/bin/jbcontext index --project-path=/session/dir");
+	});
+
+	it("classifies command-not-found stderr as git missing (exit 0 path)", async () => {
+		const logCalls: LogCall[] = [];
+		const client = makeClient(logCalls, { s1: "/session/dir" });
+		const { $ } = makeShell({
+			"git -C /session/dir rev-parse --show-toplevel": {
+				stdout: "",
+				stderr: "sh: git: command not found",
+				exitCode: 1,
+			},
+			"/usr/local/bin/jbcontext index --project-path=/session/dir": {
+				stdout: "",
+				stderr: "",
+				exitCode: 0,
+			},
+		});
+
+		const plugin = await jbcontextPlugin({
+			client: client as never,
+			$,
+			directory: "/init/dir",
+		} as never);
+
+		await plugin.config(CONFIG_ONE as never);
+
+		await (
+			plugin.tool.jbcontext_index.execute as (args: never, ctx: never) => Promise<string>
+		)({} as never, { directory: "/session/dir", sessionID: "s1" } as never);
 
 		expect(logCalls).toContainEqual(
 			expect.objectContaining({
-				extra: expect.objectContaining({
-					error: expect.stringContaining("could not determine git root"),
-				}),
+				level: "warn",
+				extra: expect.objectContaining({ decision: "git-missing" }),
 			}),
 		);
 	});

@@ -14,9 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installer's default `~/.jbcontext/bin/jbcontext`) and registers a
   `jbcontext` MCP entry on the runtime config — spawned in the same session,
   no restart or config editing needed. The registered command is always an
-  absolute path. Existing jbcontext MCP entries are never overridden —
-  including explicitly disabled entries, matched by binary basename
-  regardless of their config key.
+  absolute path. Wrapper invocations (`npx`/`env` launchers with the binary
+  at argv[1]) are detected too. Existing jbcontext MCP entries are never
+  overridden — including explicitly disabled entries, matched by binary
+  basename regardless of their config key, and any entry under the literal
+  `jbcontext` key regardless of type.
+- Git-optional indexing: inside a git repository the repo root is indexed
+  (canonicalizing subdirectories and worktrees); outside one — or when git
+  is not installed — the directory itself is indexed (jbcontext derives a
+  stable repository id from the path). A missing git binary logs one
+  warning per directory; non-git directories log at debug.
 - Single warning with the official install command when the jbcontext CLI is
   not installed; the plugin stays inactive instead of spamming errors.
 - Background indexing on session creation (`session.created` event), mirroring

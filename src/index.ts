@@ -96,11 +96,13 @@ export type ServerMatch = {
 
 /**
  * Pure: scan merged config for jbcontext MCP servers by binary basename.
- * By default only enabled local servers match; with `includeDisabled`,
- * disabled local servers match too (used to respect explicit keep-it-off
- * entries regardless of their config key). Remote entries are invisible to
- * both scans by design — they are respected via the key-existence guard in
- * the config hook, not basename matching.
+ * Matches the binary at argv[0] or argv[1] — the latter covers wrapper
+ * invocations like `["npx", "jbcontext", "mcp"]` or `["/usr/bin/env",
+ * "jbcontext", "mcp"]`. By default only enabled local servers match; with
+ * `includeDisabled`, disabled local servers match too (used to respect
+ * explicit keep-it-off entries regardless of their config key). Remote
+ * entries are invisible to both scans by design — they are respected via
+ * the key-existence guard in the config hook, not basename matching.
  */
 export function findJbcontextServer(
 	config: unknown,
@@ -118,7 +120,10 @@ export function findJbcontextServer(
 			if (!options.includeDisabled && server?.enabled === false) continue;
 			const cmd = server?.command;
 			if (!Array.isArray(cmd) || cmd.length === 0) continue;
-			if (basename(String(cmd[0])) === "jbcontext") {
+			const isJbcontext = cmd
+				.slice(0, 2)
+				.some((arg) => basename(String(arg)) === "jbcontext");
+			if (isJbcontext) {
 				matches.push({ name, binPath: String(cmd[0]) });
 			}
 		}
@@ -140,7 +145,10 @@ export type Log = (
 export type JbcontextPluginDeps = {
 	/** Structured log via the opencode SDK. */
 	log: Log;
-	/** Cached git root lookup from the given cwd. Throws on failure. */
+	/**
+	 * Resolve the index root for a directory: git repo root when available,
+	 * the directory itself otherwise (git optional). Never throws.
+	 */
 	getGitRoot: (cwd: string) => Promise<string>;
 	/** Resolve the working directory for a session (SDK lookup with fallback). */
 	getSessionDirectory: (sessionID: string) => Promise<string>;
@@ -313,9 +321,11 @@ export function createHooks(deps: JbcontextPluginDeps) {
 					);
 				});
 			} catch (err) {
+				// getGitRoot no longer throws for non-git dirs; this only fires
+				// on unexpected internal errors.
 				await deps.log(
 					"debug",
-					`jbcontext: could not resolve git root at session start, skipping background index`,
+					`jbcontext: could not resolve index root at session start, skipping background index`,
 					{
 						directory: dir,
 						sessionID: info.id,
@@ -350,11 +360,12 @@ export function createHooks(deps: JbcontextPluginDeps) {
 			}
 		},
 
-		// Manual tool: index the current repo on demand.
+		// Manual tool: index the current directory on demand (git optional —
+		// non-git directories are indexed as plain directories).
 		tool: {
 			jbcontext_index: {
 				description:
-					"Run a fresh jbcontext index of the current git repository. Use this to refresh the semantic search index after making code changes, before re-running jbcontext_code_search. Takes no arguments — indexes the repo root of the current working directory.",
+					"Run a fresh jbcontext index of the current project directory. Use this to refresh the semantic search index after making code changes, before re-running jbcontext_code_search. Takes no arguments — indexes the current working directory (the git repository root when inside one, the directory itself otherwise).",
 				args: {},
 				async execute(
 					_args: Record<string, never>,
@@ -377,8 +388,10 @@ export const jbcontextPlugin: Plugin = async ({
 	directory,
 }: PluginInput) => {
 	// --- state (per opencode process) ---
-	// git root cache keyed by cwd. Unbounded by design: bounded in practice by
-	// the number of distinct working directories seen per opencode process.
+	// index-root cache keyed by cwd (git root when available, the directory
+	// itself otherwise). Unbounded by design: bounded in practice by the
+	// number of distinct working directories seen per opencode process. The
+	// cache also makes the git-missing warning fire at most once per cwd.
 	const gitRootCache = new Map<string, string>();
 	// session directory cache keyed by sessionID. Unbounded by design: bounded
 	// in practice by the number of sessions per opencode process.
@@ -394,20 +407,49 @@ export const jbcontextPlugin: Plugin = async ({
 		return Promise.resolve();
 	};
 
-	/** Cached git root lookup from the given cwd. Throws on failure. */
-	const getGitRoot = async (cwd: string): Promise<string> => {
+	/**
+	 * Resolve the index root for a directory: the git repository root when
+	 * the directory is inside one, the directory itself otherwise. Git is
+	 * optional — jbcontext indexes non-git directories (deriving its own
+	 * stable repository id from the path).
+	 *
+	 * Classification from the rev-parse result:
+	 * - git binary missing (exit 127 / "command not found") → warn once per
+	 *   directory, fall back to the directory itself.
+	 * - anything else (not a repo, permission, …) → debug, fall back to the
+	 *   directory itself.
+	 */
+	const resolveIndexRoot = async (cwd: string): Promise<string> => {
 		const cached = gitRootCache.get(cwd);
 		if (cached) return cached;
 		const out = await $`git -C ${cwd} rev-parse --show-toplevel`.nothrow().quiet();
 		const root = out.stdout.toString().trim();
-		if (out.exitCode !== 0 || !root) {
-			const stderr = out.stderr.toString().trim();
-			throw new Error(
-				`jbcontext-index: could not determine git root from "${cwd}"${stderr ? `: ${stderr}` : ""}`,
+		if (out.exitCode === 0 && root) {
+			gitRootCache.set(cwd, root);
+			return root;
+		}
+		const stderr = out.stderr.toString().trim();
+		const gitMissing =
+			out.exitCode === 127 ||
+			/command not found/i.test(stderr) ||
+			/No such file or directory.*git\b/i.test(stderr);
+		if (gitMissing) {
+			// Warn per directory: the gitRootCache guarantees this
+			// classification runs at most once per cwd.
+			await log(
+				"warn",
+				`jbcontext: git is not installed or not on PATH; indexing "${cwd}" as a plain directory (repo-root canonicalization disabled). Install git for repository-aware indexing.`,
+				{ directory: cwd, decision: "git-missing" },
+			);
+		} else {
+			await log(
+				"debug",
+				`jbcontext: "${cwd}" is not inside a git repository; indexing it as a plain directory`,
+				{ directory: cwd, decision: "non-git" },
 			);
 		}
-		gitRootCache.set(cwd, root);
-		return root;
+		gitRootCache.set(cwd, cwd);
+		return cwd;
 	};
 
 	/**
@@ -473,5 +515,10 @@ export const jbcontextPlugin: Plugin = async ({
 		);
 	};
 
-	return createHooks({ log, getGitRoot, getSessionDirectory, runIndex });
+	return createHooks({
+		log,
+		getGitRoot: resolveIndexRoot,
+		getSessionDirectory,
+		runIndex,
+	});
 };

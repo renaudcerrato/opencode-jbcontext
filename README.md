@@ -64,14 +64,16 @@ This plugin gives OpenCode the same treatment: the repository is indexed automat
 
 The plugin mirrors jbcontext's own Codex SessionStart hook (`jbcontext index --silent &`):
 
-1. **MCP registration** — if no jbcontext MCP server is configured, the plugin registers one automatically (resolving the binary from `PATH`, then the installer's default `~/.jbcontext/bin/jbcontext`). OpenCode initializes plugins before MCP servers, so the registered server is spawned in the same session — no restart, no config editing. An existing jbcontext MCP entry is never overridden.
-2. **Session start** — when a session is created, the plugin resolves the session's git repository root and kicks off `jbcontext index` in the background (fire-and-forget). The session never waits for indexing.
+1. **MCP registration** — if no jbcontext MCP server is configured, the plugin registers one automatically (resolving the binary from `PATH`, then the installer's default `~/.jbcontext/bin/jbcontext`). Wrapper invocations (`["npx", "jbcontext", "mcp"]`, `["/usr/bin/env", "jbcontext", "mcp"]`) are detected too — the binary may sit at argv[0] or argv[1]. OpenCode initializes plugins before MCP servers, so the registered server is spawned in the same session — no restart, no config editing. An existing jbcontext MCP entry is never overridden (matched by binary basename, enabled or disabled; any entry under the literal `jbcontext` key is respected regardless of type).
+2. **Session start** — when a session is created, the plugin resolves the session's index root and kicks off `jbcontext index` in the background (fire-and-forget). The session never waits for indexing.
 3. **Before a search** — when the semantic search tool runs (named `<your-server-key>_code_search`, typically `jbcontext_code_search`), the plugin joins an in-flight index if one is running (so the search sees fresh content) but never starts one. Indexing is triggered by session start and the manual tool only.
 4. **On demand** — the `jbcontext_index` tool (below) runs a fresh index whenever the agent asks for one.
 
 Concurrent index runs for the same repository are deduplicated: a caller that arrives while an index is running gets that run's output instead of spawning a second one.
 
 Worktree sessions index the correct repository root — the plugin resolves the session's working directory through the OpenCode SDK, not the startup directory.
+
+**Git is optional.** Inside a git repository the plugin indexes the repo root (canonicalizing subdirectories and worktrees to one index). Outside one — or when git isn't installed — it indexes the directory itself; jbcontext derives a stable repository id from the path either way. A missing git binary logs one warning per directory; a plain non-git directory logs at debug.
 
 If the jbcontext CLI is not installed, the plugin logs a single warning with the install command and stays inactive:
 
@@ -88,13 +90,14 @@ The plugin registers a `jbcontext_index` tool that agents can call to force a fr
 jbcontext_index({})
 ```
 
-It takes no arguments, indexes the repository root of the current working directory, and returns the jbcontext CLI output (stdout + stderr) so indexing progress, warnings, and diagnostics are visible to the agent.
+It takes no arguments, indexes the current working directory (the git repository root when inside one, the directory itself otherwise), and returns the jbcontext CLI output (stdout + stderr) so indexing progress, warnings, and diagnostics are visible to the agent.
 
 ## Requirements
 
 - [OpenCode](https://opencode.ai)
 - POSIX (macOS/Linux): binary resolution walks `PATH` and the installer's default location; Windows is not supported (the plugin degrades gracefully to inactive).
 - The [jbcontext CLI](https://jbcontext.com) installed and authenticated (`jbcontext login`) — the plugin registers the MCP server itself, but authentication is interactive and stays the user's job.
+- Git (optional): enables repo-root canonicalization. Without it, directories are indexed as plain directories.
 
 The plugin self-gates: if the jbcontext binary cannot be found (neither on `PATH` nor at the installer's default location), it logs one warning and stays inactive. Configuring more than one enabled jbcontext MCP server is an error.
 
