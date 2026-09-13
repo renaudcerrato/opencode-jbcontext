@@ -91,6 +91,47 @@ const sessionCreatedEvent = (id: string, directory: string) => ({
 // basename
 // ---------------------------------------------------------------------------
 
+	function makeClient(logCalls: LogCall[], sessionDirs: Record<string, string>) {
+		return {
+			app: {
+				log: async (input: { body: LogCall }) => {
+					logCalls.push(input.body);
+				},
+			},
+			session: {
+				get: async ({ path }: { path: { id: string } }) => {
+					const dir = sessionDirs[path.id];
+					if (dir === undefined) {
+						throw new Error("session not found");
+					}
+					return { data: { directory: dir } };
+				},
+			},
+		};
+	}
+
+	function makeShell(commands: Record<string, { stdout: string; stderr: string; exitCode: number }>) {
+		const shellCalls: string[] = [];
+		const $ = (strings: TemplateStringsArray, ...values: unknown[]) => {
+			const cmd = strings
+				.flatMap((s, i) => (i < values.length ? [s, String(values[i])] : [s]))
+				.join("")
+				.trim();
+			shellCalls.push(cmd);
+			const result = commands[cmd] ?? { stdout: "", stderr: "", exitCode: 1 };
+			return {
+				nothrow: () => ({
+					quiet: async () => ({
+						stdout: Buffer.from(result.stdout),
+						stderr: Buffer.from(result.stderr),
+						exitCode: result.exitCode,
+					}),
+				}),
+			};
+		};
+		return { $, shellCalls };
+	}
+
 describe("basename", () => {
 	it("returns the last path segment", () => {
 		expect(basename("/usr/local/bin/jbcontext")).toBe("jbcontext");
@@ -310,6 +351,20 @@ describe("resolveBinaryPath", () => {
 			throw new Error("ENOENT");
 		};
 		expect(resolveBinaryPath()).toBeNull();
+	});
+
+	it("ignores a non-executable file squatting a PATH slot (X_OK check)", () => {
+		process.env.PATH = "/squat/bin:/real/bin";
+		fs.accessSync = (p: any, mode?: number) => {
+			if (p === "/squat/bin/jbcontext") {
+				const error: NodeJS.ErrnoException = new Error("EACCES: permission denied");
+				error.code = "EACCES";
+				throw error;
+			}
+			if (p === "/real/bin/jbcontext" && mode === fs.constants.X_OK) return undefined;
+			throw new Error("ENOENT");
+		};
+		expect(resolveBinaryPath()).toBe("/real/bin/jbcontext");
 	});
 });
 
@@ -803,7 +858,7 @@ describe("createHooks event", () => {
 		expect(runCount).toBe(1);
 	});
 
-	it("detects wrapper-script commands (npx/env launchers) and adopts them", async () => {
+	it("detects wrapper-script commands and resolves the real binary for indexing", async () => {
 		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
 		const hooks = createHooks(deps);
 		const cfg = {
@@ -813,15 +868,16 @@ describe("createHooks event", () => {
 		};
 		await hooks.config(cfg as never);
 		// The wrapper server is detected and adopted — no duplicate registered.
+		// Index runs use the resolved real binary, not the wrapper.
 		expect(hooks.__state()).toEqual({
 			enabled: true,
 			serverName: "jetbrains-context",
-			binPath: "npx",
+			binPath: "/opt/jbcontext",
 		});
 		expect(Object.keys(cfg.mcp)).toEqual(["jetbrains-context"]);
 	});
 
-	it("detects env-wrapper commands at argv[1]", async () => {
+	it("detects env-wrapper commands at argv[1] and resolves the real binary", async () => {
 		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
 		const hooks = createHooks(deps);
 		const cfg = {
@@ -833,7 +889,66 @@ describe("createHooks event", () => {
 		expect(hooks.__state()).toEqual({
 			enabled: true,
 			serverName: "jb",
-			binPath: "/usr/bin/env",
+			binPath: "/opt/jbcontext",
+		});
+	});
+
+	it("resolves the real binary via the default resolver for wrapper servers", async () => {
+		// Hermetic: force the real resolver to find a hit via mocked fs.
+		const originalAccess = fs.accessSync;
+		const originalPath = process.env.PATH;
+		process.env.PATH = "/resolved/bin";
+		fs.accessSync = (p: any) => {
+			if (p === "/resolved/bin/jbcontext") return undefined;
+			throw new Error("ENOENT");
+		};
+		try {
+			const deps = makeDeps();
+			const hooks = createHooks(deps);
+			const cfg = {
+				mcp: {
+					jb: { type: "local", command: ["npx", "jbcontext", "mcp"] },
+				},
+			};
+			await hooks.config(cfg as never);
+			expect(hooks.__state()).toEqual({
+				enabled: true,
+				serverName: "jb",
+				binPath: "/resolved/bin/jbcontext",
+			});
+		} finally {
+			fs.accessSync = originalAccess;
+			if (originalPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = originalPath;
+			}
+		}
+	});
+
+	it("degrades to inactive when a wrapper server exists but the CLI is missing", async () => {
+		const deps = makeDeps({ resolveBinary: () => null });
+		const hooks = createHooks(deps);
+		const cfg = {
+			mcp: {
+				"jetbrains-context": { type: "local", command: ["npx", "jbcontext", "mcp"] },
+			},
+		};
+		await hooks.config(cfg as never);
+		// The user's server still runs; only the plugin's index triggers no-op.
+		expect(hooks.__state()).toEqual({
+			enabled: false,
+			serverName: null,
+			binPath: null,
+		});
+		expect(deps.logCalls).toHaveLength(1);
+		expect(deps.logCalls[0].level).toBe("warn");
+		expect(deps.logCalls[0].message).toContain("uses a wrapper command");
+		expect(deps.logCalls[0].extra).toEqual({
+			serverName: "jetbrains-context",
+			wrapper: "npx",
+			decision: "cli-missing",
+			installCommand: INSTALL_COMMAND,
 		});
 	});
 
@@ -986,19 +1101,6 @@ describe("createHooks event", () => {
 		await expect(search).resolves.toBeUndefined();
 	});
 
-	it("ignores a non-executable file squatting a PATH slot (X_OK check)", () => {
-		process.env.PATH = "/squat/bin:/real/bin";
-		fs.accessSync = (p: any, mode?: number) => {
-			if (p === "/squat/bin/jbcontext") {
-				const error: NodeJS.ErrnoException = new Error("EACCES: permission denied");
-				error.code = "EACCES";
-				throw error;
-			}
-			if (p === "/real/bin/jbcontext" && mode === fs.constants.X_OK) return undefined;
-			throw new Error("ENOENT");
-		};
-		expect(resolveBinaryPath()).toBe("/real/bin/jbcontext");
-	});
 
 	it("ignores malformed session.created events without info.directory", async () => {
 		const deps = makeDeps();
@@ -1009,6 +1111,17 @@ describe("createHooks event", () => {
 		} as never);
 		await hooks.event({
 			event: { type: "session.created", properties: { info: {} } },
+		} as never);
+		expect(deps.gitRootCalls).toEqual([]);
+		expect(deps.runIndexCalls).toEqual([]);
+	});
+
+	it("ignores session.created events with an empty-string directory", async () => {
+		const deps = makeDeps();
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+		await hooks.event({
+			event: { type: "session.created", properties: { info: { id: "s1", directory: "" } } },
 		} as never);
 		expect(deps.gitRootCalls).toEqual([]);
 		expect(deps.runIndexCalls).toEqual([]);
@@ -1410,57 +1523,6 @@ describe("jbcontextPlugin", () => {
 		);
 	});
 
-	it("ignores session.created events with an empty-string directory", async () => {
-		const deps = makeDeps();
-		const hooks = createHooks(deps);
-		await hooks.config(CONFIG_ONE as never);
-		await hooks.event({
-			event: { type: "session.created", properties: { info: { id: "s1", directory: "" } } },
-		} as never);
-		expect(deps.gitRootCalls).toEqual([]);
-		expect(deps.runIndexCalls).toEqual([]);
-	});
-
-	function makeClient(logCalls: LogCall[], sessionDirs: Record<string, string>) {
-		return {
-			app: {
-				log: async (input: { body: LogCall }) => {
-					logCalls.push(input.body);
-				},
-			},
-			session: {
-				get: async ({ path }: { path: { id: string } }) => {
-					const dir = sessionDirs[path.id];
-					if (dir === undefined) {
-						throw new Error("session not found");
-					}
-					return { data: { directory: dir } };
-				},
-			},
-		};
-	}
-
-	function makeShell(commands: Record<string, { stdout: string; stderr: string; exitCode: number }>) {
-		const shellCalls: string[] = [];
-		const $ = (strings: TemplateStringsArray, ...values: unknown[]) => {
-			const cmd = strings
-				.flatMap((s, i) => (i < values.length ? [s, String(values[i])] : [s]))
-				.join("")
-				.trim();
-			shellCalls.push(cmd);
-			const result = commands[cmd] ?? { stdout: "", stderr: "", exitCode: 1 };
-			return {
-				nothrow: () => ({
-					quiet: async () => ({
-						stdout: Buffer.from(result.stdout),
-						stderr: Buffer.from(result.stderr),
-						exitCode: result.exitCode,
-					}),
-				}),
-			};
-		};
-		return { $, shellCalls };
-	}
 
 	it("wires the SDK: session dir lookup, git root, and index run", async () => {
 		const logCalls: LogCall[] = [];
@@ -1871,7 +1933,7 @@ describe("jbcontextPlugin", () => {
 		const { $ } = makeShell({
 			"git -C /session/dir rev-parse --show-toplevel": {
 				stdout: "",
-				stderr: "sh: git: command not found",
+				stderr: "/bin/sh: git: command not found",
 				exitCode: 1,
 			},
 			"/usr/local/bin/jbcontext index --project-path=/session/dir": {

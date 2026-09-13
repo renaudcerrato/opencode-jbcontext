@@ -238,7 +238,35 @@ export function createHooks(deps: JbcontextPluginDeps) {
 			if (match.matchCount === 1) {
 				enabled = true;
 				serverName = match.serverName;
-				binPath = match.binPath;
+				const matchedBin = match.binPath as string;
+				binPath = matchedBin;
+				// Wrapper adoption: when the matched command's argv[0] is a
+				// wrapper (npx, env, …) rather than the jbcontext binary
+				// itself, the plugin's index runs must invoke the real binary,
+				// not the wrapper (`npx index …` would fail). Resolve it; if
+				// unavailable, degrade to inactive — the user's MCP server
+				// still runs, only the plugin's index triggers no-op.
+				if (basename(matchedBin) !== "jbcontext") {
+					const resolved = (deps.resolveBinary ?? resolveBinaryPath)();
+					if (!resolved) {
+						const adoptedServer = serverName;
+						enabled = false;
+						serverName = null;
+						binPath = null;
+						await deps.log(
+							"warn",
+							`jbcontext: MCP server "${adoptedServer}" uses a wrapper command ("${matchedBin} …") but the jbcontext binary was not found for indexing (checked PATH and ${DEFAULT_BIN_PATH}). Install it with: ${INSTALL_COMMAND}`,
+							{
+								serverName: adoptedServer,
+								wrapper: matchedBin,
+								decision: "cli-missing",
+								installCommand: INSTALL_COMMAND,
+							},
+						);
+						return;
+					}
+					binPath = resolved;
+				}
 				return;
 			}
 			// No enabled jbcontext server. Before auto-registering, respect any
@@ -431,11 +459,13 @@ export const jbcontextPlugin: Plugin = async ({
 		const stderr = out.stderr.toString().trim();
 		const gitMissing =
 			out.exitCode === 127 ||
-			/command not found/i.test(stderr) ||
-			/No such file or directory.*git\b/i.test(stderr);
+			/command not found:?\s*git\b/i.test(stderr) ||
+			/\bgit\b:?\s*command not found/i.test(stderr) ||
+			/No such file or directory.*\bgit\b/i.test(stderr);
 		if (gitMissing) {
-			// Warn per directory: the gitRootCache guarantees this
-			// classification runs at most once per cwd.
+			// Warn per directory: the index-root cache guarantees this
+			// classification runs at most once per cwd for sequential calls
+			// (concurrent first calls may both warn — cosmetic only).
 			await log(
 				"warn",
 				`jbcontext: git is not installed or not on PATH; indexing "${cwd}" as a plain directory (repo-root canonicalization disabled). Install git for repository-aware indexing.`,
