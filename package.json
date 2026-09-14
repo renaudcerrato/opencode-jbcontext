@@ -4,6 +4,9 @@
   "description": "OpenCode plugin that keeps the current project directory indexed by JetBrains Context (jbcontext) for semantic code search.",
   "main": "src/index.ts",
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "src",
     "README.md",
