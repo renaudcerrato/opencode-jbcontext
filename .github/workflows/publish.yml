@@ -5,16 +5,29 @@ name: Publish
 #   package settings → Trusted Publisher → GitHub Actions
 #   repository: renaudcerrato/opencode-jbcontext
 #   workflow:   publish.yml
-# Trigger by running the workflow manually from the Actions tab (or via
-# `gh workflow run publish.yml`); it publishes whatever version is in
-# package.json.
+#
+# Automatic: any push to main whose package.json version is not yet on npm
+# (i.e. a version bump merged to main) is published, tagged, and released
+# with the matching CHANGELOG.md section as release notes. Pushes where the
+# version is already published (regular commits, badge-bot commits) exit
+# early without touching npm.
+# Manual: `gh workflow run publish.yml` still works for re-runs.
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
   id-token: write
+
+# Serialize publishes on the same ref: a second version-bump push queues
+# behind the first, then its "already published" check sees the new version
+# on npm and skips instead of racing npm's atomic same-version rejection.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -24,29 +37,57 @@ jobs:
     # branch and would publish whatever is checked out.
     if: github.ref == 'refs/heads/main'
     permissions:
-      contents: write # tag push in the "Tag the release" step
+      contents: write # tag push and GitHub release
       id-token: write # npm provenance
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+      # Cheap gate before installing dependencies: compare package.json
+      # against the npm registry. No node setup needed — the runner has one.
       - name: Check version is not already published
+        id: check
         run: |
           VERSION=$(node -p "require('./package.json').version")
           NAME=$(node -p "require('./package.json').name")
           if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
-            echo "::error::$NAME@$VERSION is already published. Bump the version first."
-            exit 1
+            echo "$NAME@$VERSION is already published — nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.check.outputs.publish == 'true'
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+        if: steps.check.outputs.publish == 'true'
+      - run: npm run typecheck
+        if: steps.check.outputs.publish == 'true'
+      - run: npm test
+        if: steps.check.outputs.publish == 'true'
       - name: Publish
+        if: steps.check.outputs.publish == 'true'
         run: npm publish --provenance --access public
       - name: Tag the release
+        if: steps.check.outputs.publish == 'true'
         run: |
           VERSION=$(node -p "require('./package.json').version")
           git tag "v$VERSION" 2>/dev/null || git tag -f "v$VERSION"
           git push origin "v$VERSION"
+      - name: Create GitHub release
+        if: steps.check.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+          # Release notes: the matching CHANGELOG.md section, if present.
+          NOTES=$(awk "/^## \\[$VERSION\\]/{flag=1;next} /^## \\[/{flag=0} flag" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md)."
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping."
+          else
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES"
+          fi
