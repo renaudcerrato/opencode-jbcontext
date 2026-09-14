@@ -44,12 +44,7 @@ jobs:
             exit 1
           fi
       - name: Publish
-        # JS-DevTools/npm-publish handles first-publish OIDC bootstrapping
-        # (raw `npm publish` 404s when the package doesn't exist yet).
-        uses: JS-DevTools/npm-publish@0fd2f4369c5d6bcfcde6091a7c527d810b9b5c3f # v4
-        with:
-          access: public
-          provenance: true
+        run: npm publish --provenance --access public
       - name: Tag the release
         run: |
           VERSION=$(node -p "require('./package.json').version")
