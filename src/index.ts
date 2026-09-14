@@ -44,7 +44,7 @@
 
 import { accessSync, constants } from "node:fs";
 import { homedir } from "node:os";
-import type { Config, Plugin, PluginInput } from "@opencode-ai/plugin";
+import type { Config, Plugin, PluginInput, PluginModule } from "@opencode-ai/plugin";
 
 /** Basename of a path (last segment after the final `/`). Avoids a node:path dependency. POSIX-only: on Windows, config paths use `/` in opencode's merged config. */
 export function basename(p: string): string {
@@ -475,3 +475,12 @@ export const jbcontextPlugin: Plugin = async ({
 		runIndex,
 	});
 };
+
+export const server = jbcontextPlugin;
+
+const pluginModule: PluginModule = {
+	id: "opencode-jbcontext",
+	server,
+};
+
+export default pluginModule;
