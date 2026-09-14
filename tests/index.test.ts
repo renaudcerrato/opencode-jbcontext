@@ -76,11 +76,6 @@ const CONFIG_ONE = {
 	},
 };
 
-const sessionCreatedEvent = (id: string, directory: string) => ({
-	type: "session.created",
-	properties: { info: { id, directory } },
-});
-
 // ---------------------------------------------------------------------------
 // basename
 // ---------------------------------------------------------------------------
@@ -625,49 +620,76 @@ describe("createHooks config", () => {
 // createHooks — event hook (session.created)
 // ---------------------------------------------------------------------------
 
-describe("createHooks event", () => {
+describe("createHooks chat.message (first prompt)", () => {
 	it("does nothing when disabled", async () => {
 		const deps = makeDeps();
 		const hooks = createHooks(deps);
-		await hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
 		expect(deps.runIndexCalls).toEqual([]);
 	});
 
-	it("does nothing for non-session.created events", async () => {
-		const deps = makeDeps();
-		const hooks = createHooks(deps);
-		await hooks.config(CONFIG_ONE as never);
-		await hooks.event({
-			event: { type: "session.idle", properties: { sessionID: "s1" } },
-		} as never);
-		expect(deps.runIndexCalls).toEqual([]);
-	});
-
-	it("indexes in the background on session.created without awaiting", async () => {
+	it("indexes in the background on the first prompt without awaiting", async () => {
 		const gate = deferred<string>();
 		const deps = makeDeps({
 			runIndex: async () => {
-				deps.runIndexCalls.push({ bin: "/usr/local/bin/jbcontext", root: "/repo" });
+				deps.runIndexCalls.push({ bin: "/usr/local/bin/jbcontext", root: "/session/s1" });
 				return gate.promise;
 			},
 		});
 		const hooks = createHooks(deps);
 		await hooks.config(CONFIG_ONE as never);
 
-		await hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
-		// The event hook resolved without waiting for runIndex (still pending).
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		// The hook resolved without waiting for runIndex (still pending).
+		expect(deps.sessionDirCalls).toEqual(["s1"]);
 		expect(deps.runIndexCalls).toEqual([
-			{ bin: "/usr/local/bin/jbcontext", root: "/repo" },
+			{ bin: "/usr/local/bin/jbcontext", root: "/session/s1" },
 		]);
 
 		gate.resolve("done");
 		await gate.promise;
 	});
 
-	it("deduplicates concurrent session-start indexes for the same repo (burst protection)", async () => {
+	it("indexes only once per session (second prompt is a no-op)", async () => {
+		const deps = makeDeps();
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		expect(deps.runIndexCalls).toHaveLength(1);
+	});
+
+	it("indexes a resumed session's first prompt (new process, same sessionID)", async () => {
+		const deps = makeDeps();
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		// Simulate a fresh process: the guard Set is empty, so a resumed
+		// session's first prompt indexes even though the session is old.
+		await hooks["chat.message"]({ sessionID: "resumed-session" } as never);
+		expect(deps.runIndexCalls).toHaveLength(1);
+		expect(deps.sessionDirCalls).toEqual(["resumed-session"]);
+	});
+
+	it("tracks sessions independently (two sessions, two indexes)", async () => {
+		const deps = makeDeps();
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		await hooks["chat.message"]({ sessionID: "s2" } as never);
+		expect(deps.runIndexCalls).toHaveLength(2);
+		expect(deps.sessionDirCalls).toEqual(["s1", "s2"]);
+	});
+
+	it("deduplicates concurrent first prompts for the same directory (burst protection)", async () => {
 		const gate = deferred<string>();
 		let runCount = 0;
 		const deps = makeDeps({
+			// Two sessions in the same directory resolve to the same key.
+			getSessionDirectory: async () => "/repo",
 			runIndex: async () => {
 				runCount += 1;
 				return gate.promise;
@@ -676,14 +698,14 @@ describe("createHooks event", () => {
 		const hooks = createHooks(deps);
 		await hooks.config(CONFIG_ONE as never);
 
-		// A burst of session creations for the same repo (subagents spawning).
-		const first = hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
-		const second = hooks.event({ event: sessionCreatedEvent("s2", "/repo") } as never);
+		// A burst of first prompts (subagents spawning in the same directory).
+		const first = hooks["chat.message"]({ sessionID: "s1" } as never);
+		const second = hooks["chat.message"]({ sessionID: "s2" } as never);
 		await Promise.all([first, second]);
 		// Both fire-and-forget runs share one in-flight index.
 		expect(runCount).toBe(1);
 
-		// A search during the burst joins the session-start index.
+		// A search during the burst joins the in-flight index.
 		const search = hooks["tool.execute.before"]({
 			tool: "jbcontext_code_search",
 			sessionID: "s1",
@@ -693,10 +715,11 @@ describe("createHooks event", () => {
 		expect(runCount).toBe(1);
 	});
 
-	it("manual tool joins a session-start index for the same repo (cross-entry-point dedupe)", async () => {
+	it("manual tool joins a first-prompt index for the same directory (cross-entry-point dedupe)", async () => {
 		const gate = deferred<string>();
 		let runCount = 0;
 		const deps = makeDeps({
+			getSessionDirectory: async () => "/repo",
 			runIndex: async () => {
 				runCount += 1;
 				return gate.promise;
@@ -705,12 +728,12 @@ describe("createHooks event", () => {
 		const hooks = createHooks(deps);
 		await hooks.config(CONFIG_ONE as never);
 
-		// Session-start index begins (fire-and-forget, minutes-long in reality).
-		await hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
+		// First-prompt index begins (fire-and-forget, minutes-long in reality).
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
 		expect(runCount).toBe(1);
 
 		// The user asks for a refresh; the manual tool must join the
-		// in-flight session-start run, not spawn a second one.
+		// in-flight run, not spawn a second one.
 		const manual = hooks.tool.jbcontext_index.execute(
 			{},
 			{ directory: "/repo", sessionID: "s2" },
@@ -787,6 +810,233 @@ describe("createHooks event", () => {
 		gate.resolve("done");
 		await Promise.all([manual, join, gate.promise]);
 		expect(runCount).toBe(1);
+	});
+
+	it("logs and swallows background index failures", async () => {
+		const deps = makeDeps({
+			runIndex: async () => {
+				throw new Error("boom");
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		// Allow the fire-and-forget rejection handler to run.
+		await new Promise((r) => setImmediate(r));
+		expect(deps.logCalls).toContainEqual(
+			expect.objectContaining({
+				level: "debug",
+				extra: expect.objectContaining({
+					root: "/session/s1",
+					sessionID: "s1",
+					error: "boom",
+				}),
+			}),
+		);
+	});
+
+	it("stringifies non-Error rejection reasons", async () => {
+		const deps = makeDeps({
+			runIndex: async () => {
+				throw "plain-string-failure";
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		// Allow the fire-and-forget rejection handler to run.
+		await new Promise((r) => setImmediate(r));
+		expect(deps.logCalls).toContainEqual(
+			expect.objectContaining({
+				extra: expect.objectContaining({ error: "plain-string-failure" }),
+			}),
+		);
+	});
+
+	it("logs and swallows session-directory resolution failures", async () => {
+		const deps = makeDeps({
+			getSessionDirectory: async () => {
+				throw new Error("sdk down");
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		expect(deps.runIndexCalls).toEqual([]);
+		expect(deps.logCalls).toContainEqual(
+			expect.objectContaining({
+				level: "debug",
+				extra: expect.objectContaining({
+					sessionID: "s1",
+					error: "sdk down",
+				}),
+			}),
+		);
+	});
+
+	it("stringifies non-Error session-directory failure reasons", async () => {
+		const deps = makeDeps({
+			getSessionDirectory: async () => {
+				throw "plain-string-failure";
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		expect(deps.logCalls).toContainEqual(
+			expect.objectContaining({
+				extra: expect.objectContaining({ error: "plain-string-failure" }),
+			}),
+		);
+	});
+
+	it("search joining an in-flight index that fails resolves without throwing", async () => {
+		const gate = deferred<string>();
+		const deps = makeDeps({
+			// The prompt's session dir matches the search's session dir, so
+			// both resolve to the same dedupe key.
+			getSessionDirectory: async () => "/repo",
+			runIndex: async () => gate.promise,
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		// First-prompt index begins; a search joins it.
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		const search = hooks["tool.execute.before"]({
+			tool: "jbcontext_code_search",
+			sessionID: "s1",
+		} as never);
+
+		// The in-flight index fails — the joiner must not throw.
+		gate.reject(new Error("auth expired"));
+		await expect(search).resolves.toBeUndefined();
+		// Allow the fire-and-forget .catch handler to run.
+		await new Promise((r) => setImmediate(r));
+		// The failure is logged exactly once (by the first-prompt .catch).
+		const failureLogs = deps.logCalls.filter((c) =>
+			c.extra.decision === undefined && c.level === "debug" && c.extra.error === "auth expired",
+		);
+		expect(failureLogs).toHaveLength(1);
+	});
+
+	it("pre-search join does not resolve before the in-flight index settles", async () => {
+		const gate = deferred<string>();
+		const deps = makeDeps({
+			// The prompt's session dir matches the search's session dir, so
+			// both resolve to the same dedupe key.
+			getSessionDirectory: async () => "/repo",
+			runIndex: async () => gate.promise,
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		// First-prompt index begins; a search joins it.
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		const search = hooks["tool.execute.before"]({
+			tool: "jbcontext_code_search",
+			sessionID: "s1",
+		} as never);
+
+		// The join is still pending after a tick (no timeout fires).
+		await new Promise((r) => setImmediate(r));
+		let settled = false;
+		void search.then(() => {
+			settled = true;
+		});
+		await new Promise((r) => setImmediate(r));
+		expect(settled).toBe(false);
+
+		// Releasing the gate resolves the search immediately.
+		gate.resolve("done");
+		await expect(search).resolves.toBeUndefined();
+	});
+
+	it("indexes two different directories concurrently (cross-directory isolation)", async () => {
+		const gates = new Map<string, ReturnType<typeof deferred<string>>>();
+		const runRoots: string[] = [];
+		const deps = makeDeps({
+			runIndex: async (_bin: string, root: string) => {
+				runRoots.push(root);
+				const gate = deferred<string>();
+				gates.set(root, gate);
+				return gate.promise;
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		// Two sessions in different directories start indexes simultaneously.
+		await hooks["chat.message"]({ sessionID: "s1" } as never);
+		await hooks["chat.message"]({ sessionID: "s2" } as never);
+		expect(runRoots.sort()).toEqual(["/session/s1", "/session/s2"]);
+
+		// Resolving the first index does not affect the second's pending run.
+		gates.get("/session/s1")!.resolve("a done");
+		await gates.get("/session/s1")!.promise;
+		gates.get("/session/s2")!.resolve("b done");
+		await gates.get("/session/s2")!.promise;
+	});
+
+	it("dedupes the same directory indexed from two sessions", async () => {
+		const gate = deferred<string>();
+		let runCount = 0;
+		const deps = makeDeps({
+			getSessionDirectory: async () => "/repo",
+			runIndex: async () => {
+				runCount += 1;
+				return gate.promise;
+			},
+		});
+		const hooks = createHooks(deps);
+		await hooks.config(CONFIG_ONE as never);
+
+		const first = hooks.tool.jbcontext_index.execute(
+			{},
+			{ directory: "/repo", sessionID: "s1" },
+		);
+		const second = hooks.tool.jbcontext_index.execute(
+			{},
+			{ directory: "/repo", sessionID: "s2" },
+		);
+		gate.resolve("done");
+		const [out1, out2] = await Promise.all([first, second]);
+		expect(runCount).toBe(1);
+		expect(out2).toBe(out1);
+	});
+
+	it("is idempotent when the config hook runs twice on the same config", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		const cfg: Record<string, unknown> = {};
+		await hooks.config(cfg as never);
+		await hooks.config(cfg as never);
+		// Second call re-detects the registered entry and stays enabled —
+		// no duplicate write, no warning.
+		expect(hooks.__state()).toEqual({
+			enabled: true,
+			serverName: "jbcontext",
+			binPath: "/opt/jbcontext",
+		});
+		expect(Object.keys(cfg.mcp as Record<string, unknown>)).toEqual(["jbcontext"]);
+		expect(deps.logCalls).toEqual([]);
+	});
+
+	it("registers on a second config call after a failed first registration", async () => {
+		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
+		const hooks = createHooks(deps);
+		// First call: frozen config, registration fails.
+		const frozen = { mcp: Object.freeze({}) as Record<string, unknown> };
+		await hooks.config(frozen as never);
+		expect(hooks.__state().enabled).toBe(false);
+		// Second call: writable config, registration succeeds.
+		const writable: Record<string, unknown> = {};
+		await hooks.config(writable as never);
+		expect(hooks.__state()).toEqual({
+			enabled: true,
+			serverName: "jbcontext",
+			binPath: "/opt/jbcontext",
+		});
 	});
 
 	it("detects wrapper-script commands and resolves the real binary for indexing", async () => {
@@ -884,226 +1134,7 @@ describe("createHooks event", () => {
 			}),
 		);
 	});
-
-	it("indexes two different repos concurrently (cross-repo isolation)", async () => {
-		const gates = new Map<string, ReturnType<typeof deferred<string>>>();
-		const runRoots: string[] = [];
-		const deps = makeDeps({
-			runIndex: async (_bin: string, root: string) => {
-				runRoots.push(root);
-				const gate = deferred<string>();
-				gates.set(root, gate);
-				return gate.promise;
-			},
-		});
-		const hooks = createHooks(deps);
-		await hooks.config(CONFIG_ONE as never);
-
-		// Two sessions in different repos start indexes simultaneously.
-		await hooks.event({ event: sessionCreatedEvent("s1", "/repoA") } as never);
-		await hooks.event({ event: sessionCreatedEvent("s2", "/repoB") } as never);
-		expect(runRoots.sort()).toEqual(["/repoA", "/repoB"]);
-
-		// Resolving repo A's index does not affect repo B's pending run.
-		gates.get("/repoA")!.resolve("a done");
-		await gates.get("/repoA")!.promise;
-		expect(gates.get("/repoB")!.promise).toBeInstanceOf(Promise);
-		gates.get("/repoB")!.resolve("b done");
-		await gates.get("/repoB")!.promise;
-	});
-
-	it("dedupes the same directory indexed from two sessions", async () => {
-		const gate = deferred<string>();
-		let runCount = 0;
-		const deps = makeDeps({
-			runIndex: async () => {
-				runCount += 1;
-				return gate.promise;
-			},
-		});
-		const hooks = createHooks(deps);
-		await hooks.config(CONFIG_ONE as never);
-
-		const first = hooks.tool.jbcontext_index.execute(
-			{},
-			{ directory: "/repo", sessionID: "s1" },
-		);
-		const second = hooks.tool.jbcontext_index.execute(
-			{},
-			{ directory: "/repo", sessionID: "s2" },
-		);
-		gate.resolve("done");
-		const [out1, out2] = await Promise.all([first, second]);
-		expect(runCount).toBe(1);
-		expect(out2).toBe(out1);
-	});
-
-	it("is idempotent when the config hook runs twice on the same config", async () => {
-		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
-		const hooks = createHooks(deps);
-		const cfg: Record<string, unknown> = {};
-		await hooks.config(cfg as never);
-		await hooks.config(cfg as never);
-		// Second call re-detects the registered entry and stays enabled —
-		// no duplicate write, no warning.
-		expect(hooks.__state()).toEqual({
-			enabled: true,
-			serverName: "jbcontext",
-			binPath: "/opt/jbcontext",
-		});
-		expect(Object.keys(cfg.mcp as Record<string, unknown>)).toEqual(["jbcontext"]);
-		expect(deps.logCalls).toEqual([]);
-	});
-
-	it("registers on a second config call after a failed first registration", async () => {
-		const deps = makeDeps({ resolveBinary: () => "/opt/jbcontext" });
-		const hooks = createHooks(deps);
-		// First call: frozen config, registration fails.
-		const frozen = { mcp: Object.freeze({}) as Record<string, unknown> };
-		await hooks.config(frozen as never);
-		expect(hooks.__state().enabled).toBe(false);
-		// Second call: writable config, registration succeeds.
-		const writable: Record<string, unknown> = {};
-		await hooks.config(writable as never);
-		expect(hooks.__state()).toEqual({
-			enabled: true,
-			serverName: "jbcontext",
-			binPath: "/opt/jbcontext",
-		});
-	});
-
-	it("search joining an in-flight index that fails resolves without throwing", async () => {
-		const gate = deferred<string>();
-		const deps = makeDeps({
-			// The search's session dir matches the event's directory, so both
-			// resolve to the same dedupe key.
-			getSessionDirectory: async () => "/repo",
-			runIndex: async () => gate.promise,
-		});
-		const hooks = createHooks(deps);
-		await hooks.config(CONFIG_ONE as never);
-
-		// Session-start index begins; a search joins it.
-		await hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
-		const search = hooks["tool.execute.before"]({
-			tool: "jbcontext_code_search",
-			sessionID: "s1",
-		} as never);
-
-		// The in-flight index fails — the joiner must not throw.
-		gate.reject(new Error("auth expired"));
-		await expect(search).resolves.toBeUndefined();
-		// Allow the fire-and-forget .catch handler to run.
-		await new Promise((r) => setImmediate(r));
-		// The failure is logged exactly once (by the session-start .catch).
-		const failureLogs = deps.logCalls.filter((c) =>
-			c.message.includes("background session-start indexing failed"),
-		);
-		expect(failureLogs).toHaveLength(1);
-	});
-
-	it("pre-search join does not resolve before the in-flight index settles", async () => {
-		const gate = deferred<string>();
-		const deps = makeDeps({
-			// The search's session dir matches the event's directory, so both
-			// resolve to the same dedupe key.
-			getSessionDirectory: async () => "/repo",
-			runIndex: async () => gate.promise,
-		});
-		const hooks = createHooks(deps);
-		await hooks.config(CONFIG_ONE as never);
-
-		// Session-start index begins; a search joins it.
-		await hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
-		const search = hooks["tool.execute.before"]({
-			tool: "jbcontext_code_search",
-			sessionID: "s1",
-		} as never);
-
-		// The join is still pending after a tick (no timeout fires).
-		await new Promise((r) => setImmediate(r));
-		let settled = false;
-		void search.then(() => {
-			settled = true;
-		});
-		await new Promise((r) => setImmediate(r));
-		expect(settled).toBe(false);
-
-		// Releasing the gate resolves the search immediately.
-		gate.resolve("done");
-		await expect(search).resolves.toBeUndefined();
-	});
-
-
-	it("ignores malformed session.created events without info.directory", async () => {
-		const deps = makeDeps();
-		const hooks = createHooks(deps);
-		await hooks.config(CONFIG_ONE as never);
-		await hooks.event({
-			event: { type: "session.created", properties: {} },
-		} as never);
-		await hooks.event({
-			event: { type: "session.created", properties: { info: {} } },
-		} as never);
-		expect(deps.runIndexCalls).toEqual([]);
-	});
-
-	it("ignores session.created events with an empty-string directory", async () => {
-		const deps = makeDeps();
-		const hooks = createHooks(deps);
-		await hooks.config(CONFIG_ONE as never);
-		await hooks.event({
-			event: { type: "session.created", properties: { info: { id: "s1", directory: "" } } },
-		} as never);
-		expect(deps.runIndexCalls).toEqual([]);
-	});
-
-	it("logs and swallows background index failures", async () => {
-		const deps = makeDeps({
-			runIndex: async () => {
-				throw new Error("boom");
-			},
-		});
-		const hooks = createHooks(deps);
-		await hooks.config(CONFIG_ONE as never);
-		await hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
-		// Allow the fire-and-forget rejection handler to run.
-		await new Promise((r) => setImmediate(r));
-		expect(deps.logCalls).toContainEqual(
-			expect.objectContaining({
-				level: "debug",
-				extra: expect.objectContaining({
-					root: "/repo",
-					sessionID: "s1",
-					error: "boom",
-				}),
-			}),
-		);
-	});
-
-
-	it("stringifies non-Error rejection reasons", async () => {
-		const deps = makeDeps({
-			runIndex: async () => {
-				throw "plain-string-failure";
-			},
-		});
-		const hooks = createHooks(deps);
-		await hooks.config(CONFIG_ONE as never);
-		await hooks.event({ event: sessionCreatedEvent("s1", "/repo") } as never);
-		// Allow the fire-and-forget rejection handler to run.
-		await new Promise((r) => setImmediate(r));
-		expect(deps.logCalls).toContainEqual(
-			expect.objectContaining({
-				extra: expect.objectContaining({ error: "plain-string-failure" }),
-			}),
-		);
-	});
 });
-
-// ---------------------------------------------------------------------------
-// createHooks — tool.execute.before (pre-search)
-// ---------------------------------------------------------------------------
 
 describe("createHooks tool.execute.before", () => {
 	it("does nothing when disabled", async () => {

@@ -7,9 +7,13 @@
  * re-indexing.
  *
  * Behavior (mirrors jbcontext's own Codex SessionStart hook, which runs
- * `jbcontext index --silent &` on session start):
- * - Session creation (`session.created` event) → indexes in the background
- *   (fire-and-forget); the session never waits for indexing.
+ * `jbcontext index --silent &` on session start/resume):
+ * - First user prompt in a session (`chat.message` hook) → indexes in the
+ *   background (fire-and-forget); the prompt never waits for indexing. The
+ *   per-session guard fires exactly once per session per opencode process,
+ *   covering new and resumed sessions alike (a resumed session keeps its
+ *   sessionID, so its first prompt after a restart re-indexes — Codex
+ *   `resume` parity).
  * - Before a `jbcontext_code_search` call → joins an in-flight index if one
  *   is running (so the search sees fresh content), but never starts one.
  * - The `jbcontext_index` tool indexes on demand and forwards the jbcontext
@@ -21,12 +25,10 @@
  *   inside one — the plugin passes the directory as-is and stays git-free.
  *
  * Directory resolution:
- * - The session-created hook uses the event's `info.directory`, so worktree
- *   sessions index their own checkout rather than the init-time project
- *   directory.
- * - The pre-search hook resolves the session's working directory from
+ * - The first-prompt hook resolves the session's working directory from
  *   `sessionID` via the opencode SDK (client.session.get), falling back to
  *   the init directory when the lookup fails or returns no directory.
+ * - The pre-search hook uses the same resolution.
  * - The manual `jbcontext_index` tool uses the session-time
  *   `ToolContext.directory` directly.
  *
@@ -167,6 +169,8 @@ export function createHooks(deps: JbcontextPluginDeps) {
 	let binPath: string | null = null;
 	// in-flight index promises keyed by directory path (resolves to CLI output)
 	const indexingPromises = new Map<string, Promise<string>>();
+	// sessions whose first prompt already triggered an index (per process)
+	const promptIndexed = new Set<string>();
 
 	/**
 	 * Index the directory, deduplicating concurrent runs for the same path
@@ -318,28 +322,43 @@ export function createHooks(deps: JbcontextPluginDeps) {
 			}
 		},
 
-		// Session creation: kick off a background index, Codex SessionStart-hook
-		// style. Fire-and-forget — never awaited, never blocks the session.
-		// Routed through indexRepo so concurrent session creations for the same
+		// First user prompt in a session: kick off a background index, Codex
+		// SessionStart-hook style (`startup|resume` parity — a resumed session
+		// keeps its sessionID, so the per-session guard fires exactly once per
+		// session per opencode process, covering new and resumed sessions
+		// alike). Fire-and-forget — never awaited, never blocks the prompt.
+		// Routed through indexRepo so concurrent triggers for the same
 		// directory (subagent bursts) share one run, and so pre-search joins
-		// can see the in-flight session-start index.
-		event: async ({ event }: { event: { type: string; properties: any } }) => {
+		// can see the in-flight index.
+		"chat.message": async (input: { sessionID: string }) => {
 			if (!enabled || !serverName || !binPath) return;
-			if (event.type !== "session.created") return;
-			const info = event.properties?.info;
-			if (!info?.directory) return;
-			const dir: string = info.directory;
-			indexRepo(binPath, dir).catch(async (err: unknown) => {
+			if (promptIndexed.has(input.sessionID)) return;
+			promptIndexed.add(input.sessionID);
+			try {
+				const dir = await deps.getSessionDirectory(input.sessionID);
+				indexRepo(binPath, dir).catch(async (err: unknown) => {
+					await deps.log(
+						"debug",
+						`jbcontext: background session-start indexing failed, proceeding without it`,
+						{
+							root: dir,
+							sessionID: input.sessionID,
+							error: err instanceof Error ? err.message : String(err),
+						},
+					);
+				});
+			} catch (err) {
+				// getSessionDirectory falls back internally; this only fires on
+				// unexpected internal errors.
 				await deps.log(
 					"debug",
-					`jbcontext: background session-start indexing failed, proceeding without it`,
+					`jbcontext: could not resolve session directory at first prompt, skipping background index`,
 					{
-						root: dir,
-						sessionID: info.id,
+						sessionID: input.sessionID,
 						error: err instanceof Error ? err.message : String(err),
 					},
 				);
-			});
+			}
 		},
 
 		// Lazy: fires before every tool call; only acts on ${serverName}_code_search.

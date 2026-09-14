@@ -21,9 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `jbcontext` key regardless of type.
 - Single warning with the official install command when the jbcontext CLI is
   not installed; the plugin stays inactive instead of spamming errors.
-- Background indexing on session creation (`session.created` event), mirroring
-  jbcontext's Codex SessionStart hook (`jbcontext index --silent &`): the
-  session never waits for indexing.
+- Background indexing on the first user prompt of a session (`chat.message`
+  hook), mirroring jbcontext's Codex SessionStart hook
+  (`jbcontext index --silent &` on `startup|resume`): the prompt never waits
+  for indexing, and resumed sessions re-index on their first prompt after a
+  restart (per-session guard, once per session per process).
 - Join-only pre-search behavior: `jbcontext_code_search` calls wait for an
   in-flight index (so the search sees fresh content) but never start one.
 - Manual `jbcontext_index` tool for on-demand re-indexing, forwarding the
