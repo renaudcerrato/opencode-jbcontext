@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-14
+
+### Changed
+
+- Background indexing now triggers on the first user prompt of a session
+  (`chat.message` hook) instead of session creation (`session.created`
+  event). This closes the gap with jbcontext's Codex SessionStart hook:
+  resumed sessions keep their sessionID, and a fresh opencode process
+  starts with an empty per-session guard, so a resumed session's first
+  prompt after a restart re-indexes — the same `startup|resume` semantics
+  as Codex. The prompt never waits for indexing (fire-and-forget), and
+  concurrent triggers for the same directory still share one run.
+
 ## [1.0.0] - 2026-09-13
 
 ### Added
@@ -31,13 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Manual `jbcontext_index` tool for on-demand re-indexing, forwarding the
   jbcontext CLI output (stdout + stderr) to the agent.
 - Concurrent index deduplication per repository.
-- Worktree-aware directory resolution: the session's working directory is
-  resolved through the OpenCode SDK, so worktree sessions index the correct
-  repository root.
+- Directory resolution through the OpenCode SDK: the session's working
+  directory is resolved from `sessionID`, so worktree sessions index the
+  correct repository root.
 - Self-gating on the presence of an enabled jbcontext MCP server in the
   merged config; ambiguous configurations (multiple enabled jbcontext
   servers) fail fast at startup.
 - 100% test coverage (statements, branches, functions, lines), enforced in
   CI.
 
+[1.1.0]: https://github.com/renaudcerrato/opencode-jbcontext/releases/tag/v1.1.0
 [1.0.0]: https://github.com/renaudcerrato/opencode-jbcontext/releases/tag/v1.0.0
