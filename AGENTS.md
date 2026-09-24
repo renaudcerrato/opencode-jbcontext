@@ -5,29 +5,34 @@ References:
 
 ## Project Overview
 
-This is an OpenCode plugin that keeps the current project directory indexed by
-JetBrains Context (jbcontext) for semantic code search. It auto-registers the
-jbcontext MCP server when none is configured (never overriding existing
-entries), indexes on session creation (mirroring jbcontext's Codex
-SessionStart hook), joins in-flight indexes before searches, and exposes a
-manual `jbcontext_index` tool.
+This is a hybrid OpenCode plugin for v1.18.29+ and v2 that keeps the current
+project directory indexed by JetBrains Context (jbcontext) for semantic code
+search. It auto-registers the MCP server when none is configured (never
+overriding existing or explicitly disabled entries), indexes on the first
+prompt per session (`chat.message` in v1, `session.hook("prompt")` in v2),
+joins in-flight indexes before searches, and exposes `jbcontext_index`.
 
 ## Do
 
 - Use TypeScript for all source files
-- Use `@opencode-ai/plugin` for type definitions
+- Import v2 runtime APIs and types from `@opencode/plugin`
+- Import v1 types from `@opencode-ai/plugin` using type-only imports
 - Keep `src/index.ts` as the main entry point
+- Default-export one hybrid plugin object with the v2
+  `Plugin.define({ id, setup })` entry and v1 `server(input)` entry; keep test
+  helpers as named exports
 - Follow the existing code patterns in the plugin
 - Keep test coverage at 100% (enforced by jest coverageThreshold)
 
 ## Don't
 
 - Add unnecessary dependencies
-- Use default exports (the plugin exports named symbols only)
+- Do not export the runtime plugin as named-only; both host loaders use the
+  hybrid default export
 - Make large speculative changes without confirming with user
-- Add indexing triggers beyond session creation and the manual tool without
-  discussing first (the design is deliberately Codex-parity: index on
-  session start, join-only before searches)
+- Add indexing triggers beyond the first prompt per session and the manual
+  tool without discussing first; pre-search behavior only joins an in-flight
+  index
 - Override an existing jbcontext MCP entry in the user's config
 
 ## Commands
@@ -40,7 +45,8 @@ manual `jbcontext_index` tool.
 
 - `src/index.ts` - Main plugin implementation (server detection, hook wiring,
   SDK adapters)
-- `tests/index.test.ts` - Jest tests (mock deps + mocked SDK client/$)
+- `tests/index.test.ts` - Jest tests (injected deps + mocked v1/v2 hosts and
+  child process)
 - `tests/setup.cjs` - Jest global setup (env pinning)
 - `jest.config.cjs` - Jest config with 100% coverage thresholds
 - `package.json` - Project metadata and dependencies
@@ -48,9 +54,10 @@ manual `jbcontext_index` tool.
 
 ## Testing
 
-- Tests exercise `createHooks` directly with mock dependencies — no real
-  filesystem, network, or opencode SDK access
-- The `jbcontextPlugin` factory is tested with mocked `client`/`$` objects
+- Tests exercise shared hooks with injected dependencies and both host adapters
+  through mocks — no real OpenCode runtime, network, or CLI process is used
+- The hybrid default export, v1 `server()` entry, and v2 `Plugin.define` setup
+  are covered; named helper exports support focused unit tests
 - Coverage must stay at 100% for statements, branches, functions, and lines
 
 ## When stuck

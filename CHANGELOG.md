@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - Unreleased
+
+### Changed
+
+- Support OpenCode v1.18.29+ and v2 with a hybrid plugin export: v1 uses `server()` and v2 uses `Plugin.define({ id, setup })`.
+- The v1 `plugin` string-array config works on both versions; v2's native `plugins: [{ "package": ... }]` form is v2-only.
+
+### Breaking Changes
+
+- OpenCode v1 releases earlier than 1.18.29 are not supported. Existing v1-compatible plugin configuration remains valid on v1.18.29+ and v2.
+
 ## [1.1.0] - 2026-09-14
 
 ### Changed

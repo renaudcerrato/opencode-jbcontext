@@ -8,8 +8,8 @@
  *
  * Behavior (mirrors jbcontext's own Codex SessionStart hook, which runs
  * `jbcontext index --silent &` on session start/resume):
- * - First user prompt in a session (`chat.message` hook) → indexes in the
- *   background (fire-and-forget); the prompt never waits for indexing. The
+ * - First user prompt in a session (`chat.message` in v1, `prompt` in v2) →
+ *   indexes in the background (fire-and-forget); the prompt never waits for indexing. The
  *   per-session guard fires exactly once per session per opencode process,
  *   covering new and resumed sessions alike (a resumed session keeps its
  *   sessionID, so its first prompt after a restart re-indexes — Codex
@@ -25,12 +25,12 @@
  *   inside one — the plugin passes the directory as-is and stays git-free.
  *
  * Directory resolution:
- * - The first-prompt hook resolves the session's working directory from
- *   `sessionID` via the opencode SDK (client.session.get), falling back to
- *   the init directory when the lookup fails or returns no directory.
+ * - The first-prompt hook resolves the session's working directory by ID
+ *   through the host's session API, falling back to the init directory when
+ *   the lookup fails or returns no directory.
  * - The pre-search hook uses the same resolution.
- * - The manual `jbcontext_index` tool uses the session-time
- *   `ToolContext.directory` directly.
+ * - The manual `jbcontext_index` tool uses `ToolContext.directory` in v1;
+ *   v2 tool contexts only expose sessionID, so v2 uses the session lookup.
  *
  * Error handling:
  * - Background indexing errors are logged and swallowed (graceful
@@ -40,13 +40,25 @@
  * - The manual `jbcontext_index` tool propagates errors to the caller.
  *
  * Self-gates on the presence of an enabled jbcontext MCP server in the
- * merged config (detected by binary basename). Throws at init if multiple
- * enabled jbcontext servers are configured.
+ * merged config (detected by binary basename). Throws if multiple enabled
+ * jbcontext servers are configured. The default export supports both the
+ * v1 server() and v2 setup() plugin loaders.
  */
 
+import { spawn } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { homedir } from "node:os";
-import type { Config, Plugin, PluginInput } from "@opencode-ai/plugin";
+import { Plugin } from "@opencode/plugin";
+import type { Hooks as V1Hooks, Plugin as V1Plugin } from "@opencode-ai/plugin";
+
+/** The two host APIs only need these MCP operations to share registration logic. */
+type ServerEditor = {
+	list(): Iterable<readonly [string, unknown]>;
+	set(name: string, config: { type: "local"; command: string[] }): void;
+};
+
+const INDEX_DESCRIPTION =
+	"Run a fresh jbcontext index of the current project directory. Use this to refresh the semantic search index after making code changes, before re-running jbcontext_code_search. Takes no arguments — indexes the current working directory.";
 
 /** Basename of a path (last segment after the final `/`). Avoids a node:path dependency. POSIX-only: on Windows, config paths use `/` in opencode's merged config. */
 export function basename(p: string): string {
@@ -65,8 +77,8 @@ export const INSTALL_COMMAND =
  * (accessSync on a bare name checks the process cwd, not PATH), then the
  * installer's default location. Returns an absolute path, or null when the
  * CLI is not installed. Check-time-only validation: the binary can still
- * change between this check and any later spawn (opencode's MCP layer owns
- * spawn failures).
+ * change between this check and any later spawn (index execution reports
+ * spawn failures; opencode owns MCP server startup).
  */
 export function resolveBinaryPath(): string | null {
 	const pathEnv = process.env.PATH ?? "";
@@ -105,9 +117,10 @@ export type ServerMatch = {
  * invocations like `["npx", "jbcontext", "mcp"]` or `["/usr/bin/env",
  * "jbcontext", "mcp"]`. By default only enabled local servers match; with
  * `includeDisabled`, disabled local servers match too (used to respect
- * explicit keep-it-off entries regardless of their config key). Remote
+ * explicit keep-it-off entries regardless of their config key). V2 uses
+ * `disabled`; v1 uses `enabled: false`. Remote
  * entries are invisible to both scans by design — they are respected via
- * the key-existence guard in the config hook, not basename matching.
+ * the key-existence guard during registration, not basename matching.
  */
 export function findJbcontextServer(
 	config: unknown,
@@ -118,11 +131,11 @@ export function findJbcontextServer(
 	if (mcp && typeof mcp === "object") {
 		for (const [name, entry] of Object.entries(mcp as Record<string, unknown>)) {
 			const server = entry as
-				| { type?: unknown; enabled?: unknown; command?: unknown }
+				| { type?: unknown; disabled?: unknown; enabled?: unknown; command?: unknown }
 				| null
 				| undefined;
 			if (server?.type !== "local") continue;
-			if (!options.includeDisabled && server?.enabled === false) continue;
+			if (!options.includeDisabled && (server.disabled === true || server.enabled === false)) continue;
 			const cmd = server?.command;
 			if (!Array.isArray(cmd) || cmd.length === 0) continue;
 			const isJbcontext = cmd
@@ -148,9 +161,9 @@ export type Log = (
 ) => Promise<void>;
 
 export type JbcontextPluginDeps = {
-	/** Structured log via the opencode SDK. */
+	/** Log diagnostics without blocking indexing. */
 	log: Log;
-	/** Resolve the working directory for a session (SDK lookup with fallback). */
+	/** Resolve the working directory for a session (host lookup with fallback). */
 	getSessionDirectory: (sessionID: string) => Promise<string>;
 	/** Run jbcontext index. Throws on failure. Returns the CLI output. */
 	runIndex: (bin: string, root: string) => Promise<string>;
@@ -159,8 +172,8 @@ export type JbcontextPluginDeps = {
 };
 
 /**
- * Build the plugin hooks given resolved dependencies. Split out from the
- * plugin factory so the hook wiring is testable without the opencode SDK.
+ * Build the plugin behavior given resolved dependencies. Split out from the
+ * host adapters so the hooks are testable without the opencode runtime.
  */
 export function createHooks(deps: JbcontextPluginDeps) {
 	// --- state (per opencode process) ---
@@ -190,8 +203,11 @@ export function createHooks(deps: JbcontextPluginDeps) {
 
 		// Register the in-flight promise synchronously, before any await, so
 		// concurrent callers can never both pass the check above.
-		const promise = deps
-			.log("info", `jbcontext: indexing ${root}…`, { root, decision: "index" })
+		// Diagnostics must not prevent the index from starting if logging fails.
+		void Promise.resolve()
+			.then(() => deps.log("info", `jbcontext: indexing ${root}…`, { root, decision: "index" }))
+			.catch(() => {});
+		const promise = Promise.resolve()
 			.then(() => deps.runIndex(bin, root))
 			.finally(() => {
 				indexingPromises.delete(key);
@@ -212,30 +228,29 @@ export function createHooks(deps: JbcontextPluginDeps) {
 	};
 
 	return {
-		/** Test visibility: whether the plugin is active and for which server. */
-		__state: () => ({ enabled, serverName, binPath }),
-
-		// Init: detect or register the jbcontext MCP server.
+		// Detect or register the jbcontext server in either host API.
 		// - An existing enabled jbcontext server in the merged config wins
 		//   (never override user config).
 		// - Otherwise, resolve the binary (PATH, then the installer's default
-		//   location) and register a `jbcontext` MCP entry on the runtime
-		//   config — opencode initializes plugins before MCP servers, so the
-		//   registered entry is spawned in the same session.
-		// - When the CLI is missing entirely, warn once with the install
+		//   location) and register a `jbcontext` MCP entry before servers load.
+		// - When the CLI is missing entirely, warn with the install
 		//   command and stay inactive.
-		config: async (cfg: Config) => {
-			// Snapshot cfg.mcp once: hostile configs (throwing getters) fail
-			// here, deterministically, instead of at unpredictable read points
-			// deeper in the hook.
-			let mcpSnapshot: unknown;
+		configureServer: (editor: ServerEditor) => {
+			// The editor contains the merged MCP entries. `set` replaces entries,
+			// so only call it after checking every existing name.
+			let mcpSnapshot: Record<string, unknown>;
 			try {
-				mcpSnapshot = (cfg as { mcp?: unknown }).mcp;
+				mcpSnapshot = Object.fromEntries(editor.list());
 			} catch {
-				// Hostile config shape (throwing getters): stay inactive.
+				// An unreadable configuration must never trigger registration.
 				enabled = false;
+				serverName = null;
+				binPath = null;
 				return;
 			}
+			enabled = false;
+			serverName = null;
+			binPath = null;
 			const match = findJbcontextServer({ mcp: mcpSnapshot });
 			if (match.matchCount > 1) {
 				throw new Error(
@@ -260,7 +275,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 						enabled = false;
 						serverName = null;
 						binPath = null;
-						await deps.log(
+						void deps.log(
 							"warn",
 							`jbcontext: MCP server "${adoptedServer}" uses a wrapper command ("${matchedBin} …") but the jbcontext binary was not found for indexing (checked PATH and ${DEFAULT_BIN_PATH}). Install it with: ${INSTALL_COMMAND}`,
 							{
@@ -269,7 +284,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 								decision: "cli-missing",
 								installCommand: INSTALL_COMMAND,
 							},
-						);
+						).catch(() => {});
 						return;
 					}
 					binPath = resolved;
@@ -292,32 +307,27 @@ export function createHooks(deps: JbcontextPluginDeps) {
 			// entry there — remote entries are invisible to the basename scans
 			// by design (they are respected via this key-existence guard, not
 			// basename matching), and any shape under that key is user intent.
-			if (
-				mcpSnapshot &&
-				typeof mcpSnapshot === "object" &&
-				Object.prototype.hasOwnProperty.call(mcpSnapshot, "jbcontext")
-			) {
+			if (Object.prototype.hasOwnProperty.call(mcpSnapshot, "jbcontext")) {
 				enabled = false;
 				return;
 			}
 			const resolved = (deps.resolveBinary ?? resolveBinaryPath)();
 			if (!resolved) {
 				enabled = false;
-				await deps.log(
+				void deps.log(
 					"warn",
 					`jbcontext: CLI not found (checked PATH and ${DEFAULT_BIN_PATH}); jbcontext MCP server not registered. Install it with: ${INSTALL_COMMAND}`,
 					{ decision: "cli-missing", installCommand: INSTALL_COMMAND },
-				);
+				).catch(() => {});
 				return;
 			}
 			try {
-				const mcp = (cfg.mcp ??= {}) as Record<string, unknown>;
-				mcp.jbcontext = { type: "local", command: [resolved, "mcp"] };
+				editor.set("jbcontext", { type: "local", command: [resolved, "mcp"] });
 				enabled = true;
 				serverName = "jbcontext";
 				binPath = resolved;
 			} catch {
-				// Frozen/sealed config: skip registration, stay inactive.
+				// An unwritable editor must not leave indexing active.
 				enabled = false;
 			}
 		},
@@ -330,13 +340,13 @@ export function createHooks(deps: JbcontextPluginDeps) {
 		// Routed through indexRepo so concurrent triggers for the same
 		// directory (subagent bursts) share one run, and so pre-search joins
 		// can see the in-flight index.
-		"chat.message": async (input: { sessionID: string }) => {
+		onPrompt: async (input: { sessionID: string }) => {
 			if (!enabled || !serverName || !binPath) return;
 			if (promptIndexed.has(input.sessionID)) return;
 			promptIndexed.add(input.sessionID);
 			try {
 				const dir = await deps.getSessionDirectory(input.sessionID);
-				indexRepo(binPath, dir).catch(async (err: unknown) => {
+				void indexRepo(binPath, dir).catch(async (err: unknown) => {
 					await deps.log(
 						"debug",
 						`jbcontext: background session-start indexing failed, proceeding without it`,
@@ -345,7 +355,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 							sessionID: input.sessionID,
 							error: err instanceof Error ? err.message : String(err),
 						},
-					);
+					).catch(() => {});
 				});
 			} catch (err) {
 				// getSessionDirectory falls back internally; this only fires on
@@ -365,7 +375,7 @@ export function createHooks(deps: JbcontextPluginDeps) {
 		// Join-only: waits for an in-flight index (so the search sees fresh
 		// content) but never starts one. Errors are logged and swallowed so
 		// code_search can still run against any existing index.
-		"tool.execute.before": async (input: { tool: string; sessionID: string }) => {
+		beforeSearch: async (input: { tool: string; sessionID: string }) => {
 			if (!enabled || !serverName || !binPath) return;
 			if (input.tool !== `${serverName}_code_search`) return;
 
@@ -385,87 +395,51 @@ export function createHooks(deps: JbcontextPluginDeps) {
 			}
 		},
 
-		// Manual tool: index the current directory on demand.
-		tool: {
-			jbcontext_index: {
-				description:
-					"Run a fresh jbcontext index of the current project directory. Use this to refresh the semantic search index after making code changes, before re-running jbcontext_code_search. Takes no arguments — indexes the current working directory.",
-				args: {},
-				async execute(
-					_args: Record<string, never>,
-					context: { directory: string; sessionID: string },
-				): Promise<string> {
-					if (!enabled || !binPath) {
-						return "jbcontext-index plugin is not active (no enabled jbcontext MCP server found in config).";
-					}
-					return indexRepo(binPath, context.directory);
-				},
-			},
+		// V1 passes its tool-context directory; v2 resolves one from sessionID.
+		// Errors propagate to the manual tool caller.
+		indexManual: async (sessionID: string, directory?: string): Promise<string> => {
+			if (!enabled || !binPath) {
+				return "jbcontext-index plugin is not active (no enabled jbcontext MCP server found in config).";
+			}
+			const dir = directory ?? await deps.getSessionDirectory(sessionID);
+			return indexRepo(binPath, dir);
 		},
 	};
 }
 
-export const jbcontextPlugin: Plugin = async ({
-	client,
-	$,
-	directory,
-}: PluginInput) => {
-	// --- state (per opencode process) ---
-	// session directory cache keyed by sessionID. Unbounded by design: bounded
-	// in practice by the number of sessions per opencode process.
-	const sessionDirCache = new Map<string, string>();
-
-	/** Structured log via opencode SDK. Never rejects. */
-	const log: Log = (level, message, extra) => {
-		client.app
-			.log({
-				body: { service: "opencode-jbcontext", level, message, extra },
-			})
-			.catch(() => {});
-		return Promise.resolve();
-	};
-
-	/**
-	 * Resolve the working directory for a session via the opencode SDK.
-	 * Falls back to the init-time `directory` if the lookup fails or returns
-	 * no data, so a stale/missing session record never blocks indexing.
-	 */
-	const getSessionDirectory = async (sessionID: string): Promise<string> => {
-		const cached = sessionDirCache.get(sessionID);
-		if (cached) return cached;
-		try {
-			const res = await client.session.get({ path: { id: sessionID } });
-			const dir = res.data?.directory;
-			if (dir) {
-				sessionDirCache.set(sessionID, dir);
-				return dir;
-			}
-			await log(
-				"warn",
-				`jbcontext: session ${sessionID} has no directory, falling back to init directory`,
-				{ sessionID, fallback: directory },
-			);
-		} catch (err) {
-			await log(
-				"warn",
-				`jbcontext: could not resolve session directory for ${sessionID}, falling back to init directory`,
-				{
-					sessionID,
-					fallback: directory,
-					error: err instanceof Error ? err.message : String(err),
-				},
-			);
-		}
-		return directory;
-	};
-
-	/** Run jbcontext index. Throws on failure with stderr in the message. Returns the CLI output. */
-	const runIndex = async (bin: string, root: string): Promise<string> => {
+/** Both hosts run the same argv-only index command and report its output. */
+function createRunIndex(log: Log): JbcontextPluginDeps["runIndex"] {
+	return async (bin, root) => {
 		const start = Date.now();
-		const out = await $`${bin} index --project-path=${root}`.nothrow().quiet();
+		let out: { exitCode: number | null; stdout: string; stderr: string };
+		try {
+			out = await new Promise<typeof out>((resolve, reject) => {
+				const child = spawn(bin, ["index", `--project-path=${root}`], {
+					cwd: root,
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+				const stdout: string[] = [];
+				const stderr: string[] = [];
+				child.stdout?.setEncoding("utf8").on("data", (chunk: string) => stdout.push(chunk));
+				child.stderr?.setEncoding("utf8").on("data", (chunk: string) => stderr.push(chunk));
+				child.once("error", reject);
+				child.once("close", (exitCode) => {
+					resolve({ exitCode, stdout: stdout.join(""), stderr: stderr.join("") });
+				});
+			});
+		} catch (err) {
+			const ms = Date.now() - start;
+			const error = err instanceof Error ? err.message : String(err);
+			await log("error", `jbcontext: indexing failed for ${root} in ${ms}ms`, {
+				root,
+				ms,
+				error,
+			});
+			throw new Error(`jbcontext-index: indexing failed for "${root}": ${error}`);
+		}
 		const ms = Date.now() - start;
 		if (out.exitCode !== 0) {
-			const stderr = out.stderr.toString().trim();
+			const stderr = out.stderr.trim();
 			await log("error", `jbcontext: indexing failed for ${root} in ${ms}ms`, {
 				root,
 				ms,
@@ -480,17 +454,135 @@ export const jbcontextPlugin: Plugin = async ({
 			ms,
 			decision: "indexed",
 		});
-		const stdout = out.stdout.toString().trim();
-		const stderr = out.stderr.toString().trim();
+		const stdout = out.stdout.trim();
+		const stderr = out.stderr.trim();
 		return (
 			[stdout, stderr].filter(Boolean).join("\n") ||
 			`jbcontext: indexed ${root} in ${ms}ms`
 		);
 	};
+}
 
-	return createHooks({
+/** Cache successful session directories, but retry missing sessions next time. */
+function createSessionDirectoryResolver(
+	lookup: (sessionID: string) => Promise<string | undefined>,
+	fallback: string,
+	log: Log,
+): JbcontextPluginDeps["getSessionDirectory"] {
+	const cache = new Map<string, string>();
+	return async (sessionID) => {
+		const cached = cache.get(sessionID);
+		if (cached) return cached;
+		try {
+			const dir = await lookup(sessionID);
+			if (dir) {
+				cache.set(sessionID, dir);
+				return dir;
+			}
+			await log(
+				"warn",
+				`jbcontext: session ${sessionID} has no directory, falling back to init directory`,
+				{ sessionID, fallback },
+			);
+		} catch (err) {
+			await log(
+				"warn",
+				`jbcontext: could not resolve session directory for ${sessionID}, falling back to init directory`,
+				{
+					sessionID,
+					fallback,
+					error: err instanceof Error ? err.message : String(err),
+				},
+			);
+		}
+		return fallback;
+	};
+}
+
+async function setupPlugin(ctx: Plugin.Context): Promise<void> {
+	/** V2 has no logging API; diagnostics must not block indexing. */
+	const log: Log = async (level, message, extra) => {
+		try {
+			console[level](message, extra);
+		} catch {
+			// Logging must not affect the index or search hooks.
+		}
+	};
+
+	const hooks = createHooks({
 		log,
-		getSessionDirectory,
-		runIndex,
+		getSessionDirectory: createSessionDirectoryResolver(
+			async (sessionID) => (await ctx.session.get({ sessionID }))?.location?.directory,
+			ctx.location.directory,
+			log,
+		),
+		runIndex: createRunIndex(log),
 	});
+	await ctx.mcp.transform(hooks.configureServer);
+	await ctx.session.hook("prompt", hooks.onPrompt);
+	await ctx.tool.hook("execute.before", hooks.beforeSearch);
+	await ctx.tool.transform((editor) => {
+		editor.add({
+			name: "jbcontext_index",
+			description: INDEX_DESCRIPTION,
+			input: { type: "object", properties: {}, additionalProperties: false },
+			async execute(_input, context) {
+				return { content: await hooks.indexManual(context.sessionID) };
+			},
+		});
+	});
+}
+
+/** V1 receives SDK and tool-context values from the host rather than v2 domains. */
+const server: V1Plugin = async ({ client, directory }) => {
+	const log: Log = async (level, message, extra) => {
+		try {
+			await client.app.log({
+				body: { service: "opencode-jbcontext", level, message, extra },
+			});
+		} catch {
+			// Logging must not affect the index or search hooks.
+		}
+	};
+	const hooks = createHooks({
+		log,
+		getSessionDirectory: createSessionDirectoryResolver(
+			async (sessionID) => (await client.session.get({ path: { id: sessionID } })).data?.directory,
+			directory,
+			log,
+		),
+		runIndex: createRunIndex(log),
+	});
+
+	const legacyHooks: V1Hooks = {
+		config: async (cfg) => {
+			hooks.configureServer({
+				list: () => Object.entries(cfg.mcp ?? {}),
+				set: (name, value) => {
+					const mcp = (cfg.mcp ??= {});
+					// V1 mutates the merged config; never overwrite an entry that
+					// appeared since the snapshot (including inherited keys).
+					if (name in mcp) throw new Error(`jbcontext: MCP entry "${name}" already exists`);
+					mcp[name] = value;
+				},
+			});
+		},
+		"chat.message": hooks.onPrompt,
+		"tool.execute.before": hooks.beforeSearch,
+		tool: {
+			jbcontext_index: {
+				description: INDEX_DESCRIPTION,
+				args: {},
+				execute: async (_args, context) => hooks.indexManual(context.sessionID, context.directory),
+			},
+		},
+	};
+	return legacyHooks;
 };
+
+export const jbcontextPlugin = {
+	...Plugin.define({ id: "opencode-jbcontext", setup: setupPlugin }),
+	server,
+};
+
+export default jbcontextPlugin;
