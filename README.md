@@ -7,7 +7,7 @@
 ![Functions](https://img.shields.io/badge/functions-100%25-brightgreen.svg?style=flat)
 ![Lines](https://img.shields.io/badge/lines-100%25-brightgreen.svg?style=flat)
 
-[OpenCode](https://opencode.ai) plugin for v1.18.29+ and v2 that keeps the current project directory indexed by [JetBrains Context (jbcontext)](https://jbcontext.com) for semantic code search — indexing on the first prompt in each session.
+[OpenCode v2](https://opencode.ai/v2/docs/) plugin that keeps the current project directory indexed by [JetBrains Context (jbcontext)](https://jbcontext.com) for semantic code search. It starts indexing on the first prompt in each session, so searches can use a fresh index without delaying the prompt.
 
 ## Contents
 
@@ -16,30 +16,24 @@
 - [How It Works](#how-it-works)
 - [The `jbcontext_index` Tool](#the-jbcontext_index-tool)
 - [Requirements](#requirements)
+- [Legacy OpenCode v1](#legacy-opencode-v1)
 - [Development](#development)
 - [License](#license)
 
 ## Installation
 
-Choose one plugin config form. For a config shared by OpenCode v1 and v2, use the v1-compatible form:
+Add the plugin to your OpenCode v2 config (`opencode.jsonc`), pinned to a version:
 
-```json
+```jsonc
 {
-  "plugin": ["@renaudcerrato/opencode-jbcontext@2.0.0"]
-}
-```
-
-OpenCode v2 normalizes this legacy form. Use it after version 2.0.0 is published to npm; OpenCode resolves npm plugins on startup. Pinning the version keeps behavior consistent across machines.
-
-For a v2-only config, use the native form instead (v1 does not understand it):
-
-```json
-{
+  "$schema": "https://opencode.ai/config.json",
   "plugins": [
     { "package": "@renaudcerrato/opencode-jbcontext@2.0.0" }
   ]
 }
 ```
+
+OpenCode installs the npm plugin automatically. Pinning the version keeps its behavior consistent until you choose to upgrade. Restart OpenCode after changing its plugin configuration.
 
 <details>
 <summary>Alternative: install from source</summary>
@@ -50,18 +44,11 @@ Clone the repo to a local workspace:
 git clone https://github.com/renaudcerrato/opencode-jbcontext.git ~/workspace/opencode-jbcontext
 ```
 
-For a shared v1/v2 config, reference the local path with the v1-compatible form:
+Reference the checkout directory in your OpenCode v2 config:
 
-```json
+```jsonc
 {
-  "plugin": ["~/workspace/opencode-jbcontext"]
-}
-```
-
-For a v2-only config, use its native form:
-
-```json
-{
+  "$schema": "https://opencode.ai/config.json",
   "plugins": [
     { "package": "~/workspace/opencode-jbcontext" }
   ]
@@ -76,16 +63,16 @@ The jbcontext MCP server exposes `jbcontext_code_search` for semantic code searc
 
 - A freshly cloned or heavily edited repo searches against a stale index.
 - You have to remember to run `jbcontext index` manually (or via a shell hook) in every session.
-- Other agents (Claude Code, Codex) get this through jbcontext's `setup-agent` SessionStart hooks; OpenCode uses this plugin for equivalent automation.
+- Other agents (Claude Code, Codex) get similar automation through jbcontext's `setup-agent` hooks; this plugin provides it for OpenCode.
 
 The plugin indexes on the first user prompt in each session, keeping semantic search current without a separate manual step.
 
 ## How It Works
 
-The v1 and v2 host adapters share the same indexing behavior:
+The plugin uses OpenCode v2 hooks to keep indexing asynchronous and search-aware:
 
-1. **MCP registration** — on either host, if no jbcontext MCP server is configured, the plugin registers one automatically (resolving the binary from `PATH`, then the installer's default `~/.jbcontext/bin/jbcontext`). Wrapper invocations (`["npx", "jbcontext", "mcp"]`, `["/usr/bin/env", "jbcontext", "mcp"]`) are detected; extra flags before the binary are not. Existing or explicitly disabled entries are never overridden.
-2. **First prompt** — v1 uses `chat.message`; v2 uses `session.hook("prompt")`. Both start `jbcontext index` for the session's directory in the background, without delaying the prompt, once per session per OpenCode process. A resumed session is indexed on its first user prompt after a restart.
+1. **MCP registration** — if no jbcontext MCP server is configured, the plugin registers one automatically (resolving the binary from `PATH`, then the installer's default `~/.jbcontext/bin/jbcontext`). Wrapper invocations (`["npx", "jbcontext", "mcp"]`, `["/usr/bin/env", "jbcontext", "mcp"]`) are detected; extra flags before the binary are not. Existing or explicitly disabled entries are never overridden.
+2. **First prompt** — `session.hook("prompt")` starts `jbcontext index` for the session's directory in the background, without delaying the prompt, once per session per OpenCode process. A resumed session is indexed on its first user prompt after a restart.
 3. **Before a search** — before the configured semantic search tool (`<your-server-key>_code_search`, typically `jbcontext_code_search`), the plugin joins an in-flight index but never starts one. Only the first prompt and manual tool trigger indexing.
 4. **On demand** — the `jbcontext_index` tool (below) runs a fresh index whenever the agent asks for one.
 
@@ -106,15 +93,27 @@ The plugin registers a `jbcontext_index` tool that agents can call to force a fr
 jbcontext_index({})
 ```
 
-It takes no arguments and returns the jbcontext CLI output (stdout + stderr). V1 uses the tool context's `directory`; v2 resolves the session directory by ID. Both fall back to the plugin's initialization directory when needed.
+It takes no arguments, indexes the session's directory, and returns the jbcontext CLI output (stdout + stderr). If the session directory cannot be resolved, it falls back to the plugin's initialization directory.
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) v1.18.29+ or a compatible v2 release (v2 API verified at v2.0.15)
+- [OpenCode v2](https://opencode.ai/v2/docs/) (tested with v2.0.16)
 - POSIX (macOS/Linux): binary resolution walks `PATH` and the installer's default location; Windows is not supported (the plugin degrades gracefully to inactive).
 - The [jbcontext CLI](https://jbcontext.com) installed and authenticated (`jbcontext login`) — the plugin registers the MCP server itself, but authentication is interactive and stays the user's job.
 
 If jbcontext is not installed, the plugin logs one warning and stays inactive. Configuring more than one enabled jbcontext MCP server is an error.
+
+## Legacy OpenCode v1
+
+OpenCode v1.18.29+ remains supported temporarily. Use the v1 `plugin` config instead of the v2 `plugins` config:
+
+```jsonc
+{
+  "plugin": ["@renaudcerrato/opencode-jbcontext@2.0.0"]
+}
+```
+
+OpenCode v2 can also read this legacy config, but new v2 installations should use the native form above. Earlier v1 releases are not supported.
 
 ## Development
 
